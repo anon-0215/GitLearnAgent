@@ -3,13 +3,21 @@ import type { ChatAnswer, LearningStep, ProjectMap, ProjectResponse } from '../t
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000';
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options?.headers ?? {})
-    },
-    ...options
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...(options?.headers ?? {})
+      },
+      ...options
+    });
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error(`无法连接后端服务 ${API_BASE}。请先启动 backend\\run_backend.bat，再刷新页面重试。`);
+    }
+    throw error;
+  }
   if (!response.ok) {
     const text = await response.text();
     let detail = text;

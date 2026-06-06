@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from app.config import get_env_value, load_environment
 from app.database import Database
 from app.services.analyzer import analyze_snapshot
 from app.services.github_client import fetch_repository
@@ -15,6 +16,8 @@ from app.services.llm_client import LLMClient
 from app.services.qa_agent import answer_question
 from app.services.report import generate_report
 
+
+load_environment()
 
 app = FastAPI(title="GitLearnAgent API", version="0.1.0")
 app.add_middleware(
@@ -39,7 +42,12 @@ class AskRequest(BaseModel):
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "llm_available": llm.available, "database": str(Path(db.path))}
+    return {
+        "ok": True,
+        "llm_available": llm.available,
+        "github_token_configured": bool(get_env_value("GITHUB_TOKEN")),
+        "database": str(Path(db.path)),
+    }
 
 
 @app.post("/api/projects/analyze")
@@ -125,4 +133,3 @@ def _bundle_or_404(project_id: str) -> dict[str, Any]:
     if not bundle:
         raise HTTPException(status_code=404, detail="项目不存在")
     return bundle
-

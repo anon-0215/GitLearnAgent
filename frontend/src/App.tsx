@@ -4,7 +4,7 @@ import {
   Clipboard,
   Download,
   FileCode2,
-  Github,
+  GitBranch,
   LayoutDashboard,
   Map,
   RefreshCw,
@@ -127,7 +127,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="brand">
-          <Github aria-hidden="true" />
+          <GitBranch aria-hidden="true" />
           <div>
             <strong>GitLearnAgent</strong>
             <span>开源项目学习导读系统</span>
@@ -147,7 +147,7 @@ export default function App() {
               placeholder="https://github.com/owner/repo"
             />
             <button type="submit" disabled={loading}>
-              {loading ? <RefreshCw className="spin" aria-hidden="true" /> : <Github aria-hidden="true" />}
+              {loading ? <RefreshCw className="spin" aria-hidden="true" /> : <GitBranch aria-hidden="true" />}
               <span>{loading ? '分析中' : '开始分析'}</span>
             </button>
           </form>
@@ -417,4 +417,3 @@ function ReportView({ markdown }: { markdown: string }) {
     </div>
   );
 }
-
