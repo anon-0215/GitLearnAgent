@@ -92,6 +92,43 @@ class DatabaseCodeChunkTests(unittest.TestCase):
             self.assertGreaterEqual(version, 2)
             self.assertEqual(db.get_project("legacy-project")["repo"], "legacy")
 
+    def test_schema_version_initialization_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "schema.sqlite"
+            db = Database(path)
+            with db.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE schema_versions
+                    SET version = ?, updated_at = ?
+                    WHERE key = ?
+                    """,
+                    (2, "fixed-timestamp", "database"),
+                )
+
+            reopened = Database(path)
+            with reopened.connect() as conn:
+                row = conn.execute(
+                    "SELECT version, updated_at FROM schema_versions WHERE key = ?",
+                    ("database",),
+                ).fetchone()
+
+            self.assertEqual(row["version"], 2)
+            self.assertEqual(row["updated_at"], "fixed-timestamp")
+
+    def test_code_chunk_foreign_key_is_enabled_and_cascades(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "foreign-key.sqlite")
+            project_id = _project_id(db)
+            db.save_code_chunks_for_project(project_id, [_chunk()])
+
+            with db.connect() as conn:
+                foreign_keys_enabled = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+                conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
+            self.assertEqual(foreign_keys_enabled, 1)
+            self.assertEqual(db.get_code_chunks(project_id), [])
+
     def test_saves_reads_and_filters_code_chunks(self):
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "chunks.sqlite")
@@ -151,6 +188,64 @@ class DatabaseCodeChunkTests(unittest.TestCase):
             other_chunks = db.get_code_chunks(project_id, path="src/other.py")
             self.assertEqual([chunk["qualified_name"] for chunk in app_chunks], ["new_name"])
             self.assertEqual([chunk["qualified_name"] for chunk in other_chunks], ["other"])
+
+    def test_empty_file_replacement_clears_previous_chunks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "empty-replace.sqlite")
+            project_id = _project_id(db)
+            db.save_code_chunks_for_project(
+                project_id,
+                [
+                    _chunk("src/app.py", "old_name", "def old_name():\n    return 1\n", symbol_name="old_name"),
+                    _chunk("src/other.py", "other", "def other():\n    return 2\n", symbol_name="other"),
+                ],
+            )
+
+            db.replace_code_chunks_for_file(project_id, "src/app.py", [])
+
+            self.assertEqual(db.get_code_chunks(project_id, path="src/app.py"), [])
+            self.assertEqual(
+                [chunk["qualified_name"] for chunk in db.get_code_chunks(project_id, path="src/other.py")],
+                ["other"],
+            )
+
+    def test_project_save_clears_stale_chunks_for_removed_python_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "stale.sqlite")
+            project_id = _project_id(db)
+            db.save_code_chunks_for_project(project_id, [_chunk("src/removed.py", "removed")])
+
+            db.save_analysis(
+                project_id,
+                {
+                    "primary_language": "Python",
+                    "frameworks": [],
+                    "files": [],
+                    "modules": [],
+                    "overview": "updated",
+                },
+                [
+                    {
+                        "path": "README.md",
+                        "extension": ".md",
+                        "language": "Markdown",
+                        "size": 8,
+                        "content": "# Demo\n",
+                        "summary": "readme",
+                        "importance": 1,
+                        "is_core": True,
+                        "imports": [],
+                        "exports": [],
+                        "symbols": [],
+                    }
+                ],
+                [],
+                [],
+            )
+
+            bundle = db.get_bundle(project_id)
+            self.assertEqual(db.get_code_chunks(project_id), [])
+            self.assertEqual([file["path"] for file in bundle["files"]], ["README.md"])
 
     def test_delete_project_removes_related_code_chunks(self):
         with tempfile.TemporaryDirectory() as directory:

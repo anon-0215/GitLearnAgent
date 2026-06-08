@@ -142,6 +142,7 @@ class Database:
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, factory=_ManagedConnection)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def _init_schema(self) -> None:
@@ -154,11 +155,11 @@ class Database:
             conn.execute(
                 """
                 UPDATE schema_versions
-                SET version = CASE WHEN version < ? THEN ? ELSE version END,
+                SET version = ?,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE key = ?
+                WHERE key = ? AND version < ?
                 """,
-                (SCHEMA_VERSION, SCHEMA_VERSION, "database"),
+                (SCHEMA_VERSION, "database", SCHEMA_VERSION),
             )
 
     def create_project(self, snapshot: dict[str, Any]) -> str:
