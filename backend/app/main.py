@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from app.config import get_env_value, load_environment
 from app.database import Database
+from app.services.code_chunker import extract_python_code_chunks_from_files
 from app.services.analyzer import analyze_snapshot
 from app.services.github_client import fetch_repository
 from app.services.learning_agent import build_learning_path
@@ -60,6 +61,14 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
     project_id = db.create_project(snapshot.to_dict())
     try:
         analysis = analyze_snapshot(snapshot)
+        chunk_result = extract_python_code_chunks_from_files(
+            snapshot.files,
+            snapshot.repository_revision,
+        )
+        if chunk_result.warnings:
+            analysis["code_chunk_warnings"] = [
+                warning.to_dict() for warning in chunk_result.warnings
+            ]
         project = {
             "id": project_id,
             "repo": snapshot.repo,
@@ -70,7 +79,13 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
         enriched_by_path = {file["path"]: file for file in enriched_files}
         for public_file in analysis["files"]:
             enriched_by_path[public_file["path"]].update(public_file)
-        db.save_analysis(project_id, analysis, list(enriched_by_path.values()), learning_steps)
+        db.save_analysis(
+            project_id,
+            analysis,
+            list(enriched_by_path.values()),
+            learning_steps,
+            [chunk.to_dict() for chunk in chunk_result.chunks],
+        )
     except Exception as exc:
         db.mark_failed(project_id, str(exc))
         raise HTTPException(status_code=500, detail=f"分析失败：{exc}") from exc

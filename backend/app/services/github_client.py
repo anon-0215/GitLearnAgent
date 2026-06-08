@@ -144,6 +144,7 @@ def fetch_repository(repo_url: str) -> RepositorySnapshot:
     branch = _fetch_json(
         f"{GITHUB_API}/repos/{owner}/{repo}/branches/{urllib.parse.quote(default_branch, safe='')}"
     )
+    repository_revision = branch.get("commit", {}).get("sha", "")
     tree_sha = branch.get("commit", {}).get("commit", {}).get("tree", {}).get("sha") or default_branch
     tree_url = f"{GITHUB_API}/repos/{owner}/{repo}/git/trees/{tree_sha}?recursive=1"
     tree = _fetch_json(tree_url)
@@ -179,6 +180,7 @@ def fetch_repository(repo_url: str) -> RepositorySnapshot:
         repo=repo,
         default_branch=default_branch,
         files=files,
+        repository_revision=repository_revision,
     )
 
 

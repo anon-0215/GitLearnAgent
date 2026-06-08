@@ -82,3 +82,16 @@ OK
 - 测试结果：8 个后端 unittest 通过。
 - 已知限制：前端构建未执行；当前未修改前端业务代码，且禁止安装新依赖。
 - 提交 SHA：待提交后补充。
+
+### 2026-06-08 Python 函数级代码块
+
+- 日期：2026-06-08
+- 模块：Python 函数级代码块
+- 功能分支：`feat/python-code-chunks`
+- 修改摘要：新增独立 Python AST 代码块提取模块，支持函数、异步函数、类、方法、异步方法、嵌套符号、装饰器起始行、多行签名、CRLF、非 ASCII 内容和语法错误警告；在仓库分析成功路径中对 `.py` 文件提取代码块并保存。
+- 数据库变化：新增 `schema_versions` 表记录轻量 schema 版本；新增 `code_chunks` 表，保存项目外键、仓库 revision、语言、路径、代码块类型、符号名、限定名、父符号、起止行号、原始内容、SHA-256 内容哈希和创建时间；新增项目级保存、文件级替换、按项目/路径/符号/类型查询和项目删除清理接口。当前仍使用幂等 SQLite 初始化，后续可引入正式迁移工具。
+- 配置变化：无。
+- 测试命令：`D:\Programme\Anaconda\envs\gitlearnagent\python.exe -B -m unittest tests.test_code_chunker tests.test_database_code_chunks`；`D:\Programme\Anaconda\envs\gitlearnagent\python.exe -B -m unittest discover tests`
+- 测试结果：最小相关测试 16 个通过；完整后端 unittest 24 个通过。
+- 已知限制：仅处理 Python AST 可静态定位的函数和类定义；不分析动态生成符号；未生成 Embedding，未实现混合检索或 RAG；前端暂不展示代码块。
+- 提交 SHA：待提交。
