@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -10,9 +11,16 @@ from typing import Any
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "gitlearn.sqlite"
+SCHEMA_VERSION = 2
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_versions (
+    key TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
     repo_url TEXT NOT NULL,
@@ -76,7 +84,45 @@ CREATE TABLE IF NOT EXISTS chat_answers (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(project_id) REFERENCES projects(id)
 );
+
+CREATE TABLE IF NOT EXISTS code_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    repository_revision TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT 'python',
+    path TEXT NOT NULL,
+    chunk_type TEXT NOT NULL,
+    symbol_name TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    parent_symbol TEXT DEFAULT '',
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_code_chunks_unique
+ON code_chunks (
+    project_id, repository_revision, path, chunk_type,
+    qualified_name, start_line, end_line
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_chunks_project_path
+ON code_chunks (project_id, path);
+
+CREATE INDEX IF NOT EXISTS idx_code_chunks_project_symbol
+ON code_chunks (project_id, qualified_name);
 """
+
+
+class _ManagedConnection(sqlite3.Connection):
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
 
 
 class Database:
@@ -94,13 +140,27 @@ class Database:
             self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, factory=_ManagedConnection)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def _init_schema(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_versions (key, version) VALUES (?, ?)",
+                ("database", SCHEMA_VERSION),
+            )
+            conn.execute(
+                """
+                UPDATE schema_versions
+                SET version = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE key = ? AND version < ?
+                """,
+                (SCHEMA_VERSION, "database", SCHEMA_VERSION),
+            )
 
     def create_project(self, snapshot: dict[str, Any]) -> str:
         project_id = str(uuid.uuid4())
@@ -137,11 +197,14 @@ class Database:
         analysis: dict[str, Any],
         files: list[dict[str, Any]],
         learning_steps: list[dict[str, Any]],
+        code_chunks: list[dict[str, Any]] | None = None,
     ) -> None:
         with self.connect() as conn:
             conn.execute("DELETE FROM repo_files WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM modules WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM learning_steps WHERE project_id = ?", (project_id,))
+            if code_chunks is not None:
+                conn.execute("DELETE FROM code_chunks WHERE project_id = ?", (project_id,))
 
             for file in files:
                 conn.execute(
@@ -202,6 +265,10 @@ class Database:
                     ),
                 )
 
+            if code_chunks is not None:
+                for chunk in code_chunks:
+                    self._insert_code_chunk(conn, project_id, chunk)
+
             conn.execute(
                 """
                 UPDATE projects
@@ -220,6 +287,80 @@ class Database:
                     project_id,
                 ),
             )
+
+    def save_code_chunks_for_project(
+        self,
+        project_id: str,
+        code_chunks: list[dict[str, Any]],
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM code_chunks WHERE project_id = ?", (project_id,))
+            for chunk in code_chunks:
+                self._insert_code_chunk(conn, project_id, chunk)
+
+    def replace_code_chunks_for_file(
+        self,
+        project_id: str,
+        path: str,
+        code_chunks: list[dict[str, Any]],
+        repository_revision: str | None = None,
+    ) -> None:
+        normalized_path = self._normalize_repo_path(path)
+        with self.connect() as conn:
+            if repository_revision is None:
+                conn.execute(
+                    "DELETE FROM code_chunks WHERE project_id = ? AND path = ?",
+                    (project_id, normalized_path),
+                )
+            else:
+                conn.execute(
+                    """
+                    DELETE FROM code_chunks
+                    WHERE project_id = ? AND path = ? AND repository_revision = ?
+                    """,
+                    (project_id, normalized_path, repository_revision),
+                )
+            for chunk in code_chunks:
+                self._insert_code_chunk(conn, project_id, chunk)
+
+    def get_code_chunks(
+        self,
+        project_id: str,
+        path: str | None = None,
+        symbol: str | None = None,
+        chunk_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        conditions = ["project_id = ?"]
+        params: list[Any] = [project_id]
+        if path:
+            conditions.append("path = ?")
+            params.append(self._normalize_repo_path(path))
+        if symbol:
+            conditions.append("(symbol_name = ? OR qualified_name = ?)")
+            params.extend([symbol, symbol])
+        if chunk_type:
+            conditions.append("chunk_type = ?")
+            params.append(chunk_type)
+        where_clause = " AND ".join(conditions)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM code_chunks
+                WHERE {where_clause}
+                ORDER BY path, start_line, qualified_name
+                """,
+                params,
+            ).fetchall()
+        return [self._code_chunk_from_row(row) for row in rows]
+
+    def delete_project(self, project_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM code_chunks WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM chat_answers WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM learning_steps WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM modules WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM repo_files WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
 
     def get_project(self, project_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -250,6 +391,14 @@ class Database:
                 "SELECT * FROM chat_answers WHERE project_id = ? ORDER BY id DESC LIMIT 20",
                 (project_id,),
             ).fetchall()
+            code_chunk_rows = conn.execute(
+                """
+                SELECT * FROM code_chunks
+                WHERE project_id = ?
+                ORDER BY path, start_line, qualified_name
+                """,
+                (project_id,),
+            ).fetchall()
 
         return {
             "project": project,
@@ -257,6 +406,7 @@ class Database:
             "modules": [self._module_from_row(row) for row in module_rows],
             "learning_steps": [self._step_from_row(row) for row in step_rows],
             "chat_answers": [self._chat_from_row(row) for row in chat_rows],
+            "code_chunks": [self._code_chunk_from_row(row) for row in code_chunk_rows],
             "analysis": project.get("analysis", {}),
         }
 
@@ -339,3 +489,73 @@ class Database:
             "citations": self._json(row["citations_json"], []),
             "created_at": row["created_at"],
         }
+
+    def _insert_code_chunk(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+        chunk: dict[str, Any],
+    ) -> None:
+        content = chunk["content"]
+        if not isinstance(content, str):
+            raise ValueError("code chunk content must be a string")
+        content_hash = chunk["content_hash"]
+        expected_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if content_hash != expected_hash:
+            raise ValueError(
+                f"code chunk hash mismatch for {chunk.get('path', '')} "
+                f"{chunk.get('qualified_name', '')}"
+            )
+        start_line = int(chunk["start_line"])
+        end_line = int(chunk["end_line"])
+        if start_line < 1 or end_line < start_line:
+            raise ValueError(
+                f"invalid code chunk line range for {chunk.get('path', '')} "
+                f"{chunk.get('qualified_name', '')}: {start_line}-{end_line}"
+            )
+        conn.execute(
+            """
+            INSERT INTO code_chunks (
+                project_id, repository_revision, language, path, chunk_type,
+                symbol_name, qualified_name, parent_symbol, start_line,
+                end_line, content, content_hash
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                chunk.get("repository_revision") or "",
+                chunk.get("language") or "python",
+                self._normalize_repo_path(chunk["path"]),
+                chunk["chunk_type"],
+                chunk["symbol_name"],
+                chunk["qualified_name"],
+                chunk.get("parent_symbol") or "",
+                start_line,
+                end_line,
+                content,
+                content_hash,
+            ),
+        )
+
+    def _code_chunk_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "project_id": row["project_id"],
+            "repository_revision": row["repository_revision"],
+            "language": row["language"],
+            "path": row["path"],
+            "chunk_type": row["chunk_type"],
+            "symbol_name": row["symbol_name"],
+            "qualified_name": row["qualified_name"],
+            "parent_symbol": row["parent_symbol"],
+            "start_line": row["start_line"],
+            "end_line": row["end_line"],
+            "content": row["content"],
+            "content_hash": row["content_hash"],
+            "created_at": row["created_at"],
+        }
+
+    @staticmethod
+    def _normalize_repo_path(path: str) -> str:
+        return path.replace("\\", "/").lstrip("/")
