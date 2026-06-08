@@ -95,3 +95,19 @@ OK
 - 测试结果：最小相关测试 16 个通过；完整后端 unittest 24 个通过。
 - 已知限制：仅处理 Python AST 可静态定位的函数和类定义；不分析动态生成符号；未生成 Embedding，未实现混合检索或 RAG；前端暂不展示代码块。
 - 提交 SHA：待提交。
+
+### 2026-06-08 本地 BGE-M3 稠密向量缓存与基础语义检索
+
+- 日期：2026-06-08
+- 模块：本地 BGE-M3 向量生成、缓存与基础语义检索
+- 功能分支：`feat/bge-m3-semantic-retrieval`
+- 修改摘要：新增独立 Embedding 服务、SQLite 向量缓存表、增量索引器和内部语义检索服务；仅实现 dense embedding，不实现关键词融合、BM25、Reranker、AST 关系扩展、RAG 问答改造或前端页面。`EMBEDDING_ENABLED=false` 时旧分析流程不加载模型。
+- 数据库变化：`SCHEMA_VERSION` 升至 3；新增 `code_chunk_embeddings` 表，保存 `code_chunk_id`、`content_hash`、模型标识、文本格式版本、维度、dtype、归一化标记和 float32 little-endian `vector_blob`；通过外键随 `code_chunks` 级联删除；新增批量 upsert、fresh cache 查询、缺失/过期查询和项目向量读取接口。代码块保存逻辑改为尽量保留既有 `code_chunk_id`，以支持未变代码块复用 embedding 缓存。
+- 配置变化：新增 `EMBEDDING_ENABLED`、`EMBEDDING_MODEL_NAME_OR_PATH`、`EMBEDDING_DEVICE`、`EMBEDDING_BATCH_SIZE`、`EMBEDDING_MAX_LENGTH`、`EMBEDDING_NORMALIZE`、`EMBEDDING_CACHE_DIR`、`EMBEDDING_QUERY_PREFIX`、`EMBEDDING_DOCUMENT_PREFIX`。
+- 依赖变化：`backend/requirements.txt` 新增 `sentence-transformers>=3.0,<6.0`；本次没有安装或升级当前 Conda 环境中的 PyTorch，也没有安装向量数据库或 LangChain/LlamaIndex 等框架。
+- 模型下载边界：默认模型名为 `BAAI/bge-m3`，也支持用户配置本地模型目录；模型延迟加载，不在导入模块或应用启动时加载；缓存目录来自配置，默认 `embedding_cache`，已由 `.gitignore` 排除；单元测试使用 Fake backend，不下载真实模型。
+- 测试命令：`D:\Programme\Anaconda\envs\gitlearnagent\python.exe -B -m unittest tests.test_embedding_service tests.test_database_embeddings tests.test_embedding_indexer tests.test_semantic_retriever`；`D:\Programme\Anaconda\envs\gitlearnagent\python.exe -B -m unittest discover tests`。
+- 测试结果：新增确定性测试 42 个通过；完整后端 unittest 70 个通过。完整测试首次运行发现旧 schema version 测试硬编码为 2，已更新为引用当前 `SCHEMA_VERSION` 后通过。
+- 是否执行真实 BGE-M3 smoke test：未执行。指定 Conda 环境当前没有 `torch`、`sentence-transformers` 或 `numpy`，且本次未获得安装/下载真实模型授权。
+- 已知限制：第一版从 SQLite 读取项目向量后在内存中点积排序，适合中小型仓库；未使用 FAISS/Chroma 等外部向量库；长代码块按固定文本格式交给模型，实际截断由 Sentence Transformers/max length 处理；本地模型目录内容变更不会自动生成内容级模型 revision；语义检索尚未接入问答、学习路线或前端。
+- 提交 SHA：待提交。

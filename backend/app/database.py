@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
+import struct
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "gitlearn.sqlite"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 SCHEMA = """
@@ -103,6 +105,22 @@ CREATE TABLE IF NOT EXISTS code_chunks (
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS code_chunk_embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code_chunk_id INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    model_revision TEXT NOT NULL DEFAULT '',
+    text_format_version TEXT NOT NULL,
+    embedding_dimension INTEGER NOT NULL,
+    embedding_dtype TEXT NOT NULL DEFAULT 'float32',
+    normalized INTEGER NOT NULL DEFAULT 1,
+    vector_blob BLOB NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(code_chunk_id) REFERENCES code_chunks(id) ON DELETE CASCADE
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_code_chunks_unique
 ON code_chunks (
     project_id, repository_revision, path, chunk_type,
@@ -114,6 +132,16 @@ ON code_chunks (project_id, path);
 
 CREATE INDEX IF NOT EXISTS idx_code_chunks_project_symbol
 ON code_chunks (project_id, qualified_name);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_code_chunk_embeddings_unique
+ON code_chunk_embeddings (
+    code_chunk_id, content_hash, model_name, model_revision, text_format_version
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_chunk_embeddings_lookup
+ON code_chunk_embeddings (
+    model_name, model_revision, text_format_version, content_hash
+);
 """
 
 
@@ -203,8 +231,6 @@ class Database:
             conn.execute("DELETE FROM repo_files WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM modules WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM learning_steps WHERE project_id = ?", (project_id,))
-            if code_chunks is not None:
-                conn.execute("DELETE FROM code_chunks WHERE project_id = ?", (project_id,))
 
             for file in files:
                 conn.execute(
@@ -266,8 +292,7 @@ class Database:
                 )
 
             if code_chunks is not None:
-                for chunk in code_chunks:
-                    self._insert_code_chunk(conn, project_id, chunk)
+                self._replace_code_chunks_in_scope(conn, project_id, code_chunks)
 
             conn.execute(
                 """
@@ -294,9 +319,7 @@ class Database:
         code_chunks: list[dict[str, Any]],
     ) -> None:
         with self.connect() as conn:
-            conn.execute("DELETE FROM code_chunks WHERE project_id = ?", (project_id,))
-            for chunk in code_chunks:
-                self._insert_code_chunk(conn, project_id, chunk)
+            self._replace_code_chunks_in_scope(conn, project_id, code_chunks)
 
     def replace_code_chunks_for_file(
         self,
@@ -307,21 +330,13 @@ class Database:
     ) -> None:
         normalized_path = self._normalize_repo_path(path)
         with self.connect() as conn:
-            if repository_revision is None:
-                conn.execute(
-                    "DELETE FROM code_chunks WHERE project_id = ? AND path = ?",
-                    (project_id, normalized_path),
-                )
-            else:
-                conn.execute(
-                    """
-                    DELETE FROM code_chunks
-                    WHERE project_id = ? AND path = ? AND repository_revision = ?
-                    """,
-                    (project_id, normalized_path, repository_revision),
-                )
-            for chunk in code_chunks:
-                self._insert_code_chunk(conn, project_id, chunk)
+            self._replace_code_chunks_in_scope(
+                conn,
+                project_id,
+                code_chunks,
+                path=normalized_path,
+                repository_revision=repository_revision,
+            )
 
     def get_code_chunks(
         self,
@@ -352,6 +367,148 @@ class Database:
                 params,
             ).fetchall()
         return [self._code_chunk_from_row(row) for row in rows]
+
+    def get_code_chunks_missing_embeddings(
+        self,
+        project_id: str,
+        model_name: str,
+        model_revision: str,
+        text_format_version: str,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.*
+                FROM code_chunks c
+                WHERE c.project_id = ?
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM code_chunk_embeddings e
+                    WHERE e.code_chunk_id = c.id
+                      AND e.content_hash = c.content_hash
+                      AND e.model_name = ?
+                      AND e.model_revision = ?
+                      AND e.text_format_version = ?
+                  )
+                ORDER BY c.path, c.start_line, c.id
+                """,
+                (project_id, model_name, model_revision, text_format_version),
+            ).fetchall()
+        return [self._code_chunk_from_row(row) for row in rows]
+
+    def get_fresh_embedding_dimensions_for_project(
+        self,
+        project_id: str,
+        model_name: str,
+        model_revision: str,
+        text_format_version: str,
+    ) -> list[int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT e.embedding_dimension
+                FROM code_chunks c
+                JOIN code_chunk_embeddings e ON e.code_chunk_id = c.id
+                WHERE c.project_id = ?
+                  AND e.content_hash = c.content_hash
+                  AND e.model_name = ?
+                  AND e.model_revision = ?
+                  AND e.text_format_version = ?
+                ORDER BY e.embedding_dimension
+                """,
+                (project_id, model_name, model_revision, text_format_version),
+            ).fetchall()
+        return [int(row["embedding_dimension"]) for row in rows]
+
+    def upsert_code_chunk_embeddings(self, records: list[dict[str, Any]]) -> None:
+        if not records:
+            return
+        with self.connect() as conn:
+            for record in records:
+                values = self._embedding_values(record)
+                conn.execute(
+                    """
+                    INSERT INTO code_chunk_embeddings (
+                        code_chunk_id, content_hash, model_name, model_revision,
+                        text_format_version, embedding_dimension, embedding_dtype,
+                        normalized, vector_blob
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (
+                        code_chunk_id, content_hash, model_name,
+                        model_revision, text_format_version
+                    )
+                    DO UPDATE SET
+                        embedding_dimension = excluded.embedding_dimension,
+                        embedding_dtype = excluded.embedding_dtype,
+                        normalized = excluded.normalized,
+                        vector_blob = excluded.vector_blob,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    values,
+                )
+
+    def get_code_chunk_embeddings_for_project(
+        self,
+        project_id: str,
+        model_name: str,
+        model_revision: str,
+        text_format_version: str,
+        path: str | None = None,
+        chunk_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        conditions = [
+            "c.project_id = ?",
+            "e.content_hash = c.content_hash",
+            "e.model_name = ?",
+            "e.model_revision = ?",
+            "e.text_format_version = ?",
+        ]
+        params: list[Any] = [project_id, model_name, model_revision, text_format_version]
+        if path:
+            conditions.append("c.path = ?")
+            params.append(self._normalize_repo_path(path))
+        if chunk_type:
+            conditions.append("c.chunk_type = ?")
+            params.append(chunk_type)
+        where_clause = " AND ".join(conditions)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    c.*,
+                    e.model_name AS embedding_model_name,
+                    e.model_revision AS embedding_model_revision,
+                    e.text_format_version AS embedding_text_format_version,
+                    e.embedding_dimension,
+                    e.embedding_dtype,
+                    e.normalized,
+                    e.vector_blob
+                FROM code_chunks c
+                JOIN code_chunk_embeddings e ON e.code_chunk_id = c.id
+                WHERE {where_clause}
+                ORDER BY c.path, c.start_line, c.id
+                """,
+                params,
+            ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = self._code_chunk_from_row(row)
+            dimension = int(row["embedding_dimension"])
+            item.update(
+                {
+                    "model_name": row["embedding_model_name"],
+                    "model_revision": row["embedding_model_revision"],
+                    "text_format_version": row["embedding_text_format_version"],
+                    "embedding_dimension": dimension,
+                    "embedding_dtype": row["embedding_dtype"],
+                    "normalized": bool(row["normalized"]),
+                    "vector": unpack_float32_vector(row["vector_blob"], dimension),
+                }
+            )
+            results.append(item)
+        return results
 
     def delete_project(self, project_id: str) -> None:
         with self.connect() as conn:
@@ -496,6 +653,75 @@ class Database:
         project_id: str,
         chunk: dict[str, Any],
     ) -> None:
+        self._insert_prepared_code_chunk(conn, self._prepare_code_chunk(project_id, chunk))
+
+    def _replace_code_chunks_in_scope(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+        code_chunks: list[dict[str, Any]],
+        path: str | None = None,
+        repository_revision: str | None = None,
+    ) -> None:
+        prepared = [self._prepare_code_chunk(project_id, chunk) for chunk in code_chunks]
+        if path is not None:
+            for chunk in prepared:
+                if chunk["path"] != path:
+                    raise ValueError(f"code chunk path {chunk['path']} does not match {path}")
+        if repository_revision is not None:
+            for chunk in prepared:
+                if chunk["repository_revision"] != repository_revision:
+                    raise ValueError(
+                        "code chunk repository revision does not match replacement scope"
+                    )
+
+        conditions = ["project_id = ?"]
+        params: list[Any] = [project_id]
+        if path is not None:
+            conditions.append("path = ?")
+            params.append(path)
+        if repository_revision is not None:
+            conditions.append("repository_revision = ?")
+            params.append(repository_revision)
+        existing_rows = conn.execute(
+            f"SELECT * FROM code_chunks WHERE {' AND '.join(conditions)}",
+            params,
+        ).fetchall()
+
+        counts: dict[tuple[str, str, str, str], int] = {}
+        for row in existing_rows:
+            key = self._code_chunk_match_key(row)
+            counts[key] = counts.get(key, 0) + 1
+        existing_by_key = {
+            self._code_chunk_match_key(row): row
+            for row in existing_rows
+            if counts[self._code_chunk_match_key(row)] == 1
+        }
+
+        kept_ids: set[int] = set()
+        for chunk in prepared:
+            existing = existing_by_key.get(self._code_chunk_match_key(chunk))
+            if existing is not None and int(existing["id"]) not in kept_ids:
+                chunk_id = int(existing["id"])
+                self._update_code_chunk(conn, chunk_id, chunk)
+                kept_ids.add(chunk_id)
+            else:
+                cursor = self._insert_prepared_code_chunk(conn, chunk)
+                kept_ids.add(int(cursor.lastrowid))
+
+        stale_ids = [int(row["id"]) for row in existing_rows if int(row["id"]) not in kept_ids]
+        if stale_ids:
+            placeholders = ",".join("?" for _ in stale_ids)
+            conn.execute(
+                f"DELETE FROM code_chunks WHERE id IN ({placeholders})",
+                stale_ids,
+            )
+
+    def _prepare_code_chunk(
+        self,
+        project_id: str,
+        chunk: dict[str, Any],
+    ) -> dict[str, Any]:
         content = chunk["content"]
         if not isinstance(content, str):
             raise ValueError("code chunk content must be a string")
@@ -513,7 +739,27 @@ class Database:
                 f"invalid code chunk line range for {chunk.get('path', '')} "
                 f"{chunk.get('qualified_name', '')}: {start_line}-{end_line}"
             )
-        conn.execute(
+        return {
+            "project_id": project_id,
+            "repository_revision": chunk.get("repository_revision") or "",
+            "language": chunk.get("language") or "python",
+            "path": self._normalize_repo_path(chunk["path"]),
+            "chunk_type": chunk["chunk_type"],
+            "symbol_name": chunk["symbol_name"],
+            "qualified_name": chunk["qualified_name"],
+            "parent_symbol": chunk.get("parent_symbol") or "",
+            "start_line": start_line,
+            "end_line": end_line,
+            "content": content,
+            "content_hash": content_hash,
+        }
+
+    def _insert_prepared_code_chunk(
+        self,
+        conn: sqlite3.Connection,
+        chunk: dict[str, Any],
+    ) -> sqlite3.Cursor:
+        return conn.execute(
             """
             INSERT INTO code_chunks (
                 project_id, repository_revision, language, path, chunk_type,
@@ -523,19 +769,90 @@ class Database:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                project_id,
-                chunk.get("repository_revision") or "",
-                chunk.get("language") or "python",
-                self._normalize_repo_path(chunk["path"]),
+                chunk["project_id"],
+                chunk["repository_revision"],
+                chunk["language"],
+                chunk["path"],
                 chunk["chunk_type"],
                 chunk["symbol_name"],
                 chunk["qualified_name"],
-                chunk.get("parent_symbol") or "",
-                start_line,
-                end_line,
-                content,
-                content_hash,
+                chunk["parent_symbol"],
+                chunk["start_line"],
+                chunk["end_line"],
+                chunk["content"],
+                chunk["content_hash"],
             ),
+        )
+
+    def _update_code_chunk(
+        self,
+        conn: sqlite3.Connection,
+        chunk_id: int,
+        chunk: dict[str, Any],
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE code_chunks
+            SET repository_revision = ?,
+                language = ?,
+                path = ?,
+                chunk_type = ?,
+                symbol_name = ?,
+                qualified_name = ?,
+                parent_symbol = ?,
+                start_line = ?,
+                end_line = ?,
+                content = ?,
+                content_hash = ?
+            WHERE id = ?
+            """,
+            (
+                chunk["repository_revision"],
+                chunk["language"],
+                chunk["path"],
+                chunk["chunk_type"],
+                chunk["symbol_name"],
+                chunk["qualified_name"],
+                chunk["parent_symbol"],
+                chunk["start_line"],
+                chunk["end_line"],
+                chunk["content"],
+                chunk["content_hash"],
+                chunk_id,
+            ),
+        )
+
+    @staticmethod
+    def _code_chunk_match_key(row: sqlite3.Row | dict[str, Any]) -> tuple[str, str, str, str]:
+        return (
+            row["repository_revision"],
+            row["path"],
+            row["chunk_type"],
+            row["qualified_name"],
+        )
+
+    def _embedding_values(self, record: dict[str, Any]) -> tuple[Any, ...]:
+        vector = list(record["vector"])
+        dimension = int(record.get("embedding_dimension") or len(vector))
+        if dimension < 1:
+            raise ValueError("embedding dimension must be positive")
+        if len(vector) != dimension:
+            raise ValueError(
+                f"embedding vector length {len(vector)} does not match dimension {dimension}"
+            )
+        dtype = record.get("embedding_dtype") or "float32"
+        if dtype != "float32":
+            raise ValueError(f"unsupported embedding dtype: {dtype}")
+        return (
+            int(record["code_chunk_id"]),
+            record["content_hash"],
+            record["model_name"],
+            record.get("model_revision") or "",
+            record["text_format_version"],
+            dimension,
+            dtype,
+            1 if record.get("normalized", True) else 0,
+            pack_float32_vector(vector),
         )
 
     def _code_chunk_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
@@ -559,3 +876,29 @@ class Database:
     @staticmethod
     def _normalize_repo_path(path: str) -> str:
         return path.replace("\\", "/").lstrip("/")
+
+
+def pack_float32_vector(vector: Sequence[float]) -> bytes:
+    values = [_as_float32(value) for value in vector]
+    if not values:
+        raise ValueError("embedding vector must not be empty")
+    return struct.pack(f"<{len(values)}f", *values)
+
+
+def unpack_float32_vector(blob: bytes, dimension: int) -> list[float]:
+    if dimension < 1:
+        raise ValueError("embedding dimension must be positive")
+    expected_length = dimension * 4
+    if len(blob) != expected_length:
+        raise ValueError(
+            f"embedding vector byte length {len(blob)} does not match "
+            f"dimension {dimension}"
+        )
+    return list(struct.unpack(f"<{dimension}f", blob))
+
+
+def _as_float32(value: float) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("embedding vectors must contain only finite numbers")
+    return struct.unpack("<f", struct.pack("<f", number))[0]
