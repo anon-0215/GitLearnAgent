@@ -110,4 +110,4 @@ OK
 - 测试结果：审查修复后 embedding 相关确定性测试 61 个通过；完整后端 unittest 89 个通过。真实 BGE-M3 smoke test 在隔离环境 `gitlearnagent-v2-embed-smoke` 中通过，设备为 CPU，模型 `BAAI/bge-m3` resolved revision 为 `5617a9f61b028005a4858fdac845db406aefb181`，输出 1024 维 float32，文档和查询向量范数约为 1。中文查询“用户身份是如何验证的？”排序为 `authenticate_user`、`initialize_database`、`upload_file`；SQLite 集成链路验证首次生成 3 个向量、第二次 3 个全部命中缓存、修改认证代码块后仅重算 1 个、检索返回 `src/auth.py` 的 `authenticate_user` 10-12 行。
 - 是否执行真实 BGE-M3 smoke test：已执行。首次下载/加载写入已忽略的 `embedding_cache\bge_m3_smoke`，未下载本地 7B，未修改原 Conda 环境。首次模型加载约 897954 ms；缓存后复跑加载约 12857 ms；文档编码约 2537 ms，查询编码约 478 ms。进程内存占用未能可靠获取。
 - 已知限制：第一版从 SQLite 读取项目向量后在内存中点积排序，适合中小型仓库；未使用 FAISS/Chroma 等外部向量库；长代码块按固定文本格式交给模型，实际截断由 Sentence Transformers/max length 处理；本地模型目录只记录目录路径标识，尚未做模型文件内容级指纹，也不会扫描并哈希数 GB 模型文件；语义检索尚未接入问答、学习路线或前端。真实依赖安装时本机 pip 配置使用 `https://pypi.tuna.tsinghua.edu.cn/simple` 镜像。
-- 提交 SHA：原功能提交 `61c042383524580de58493b64a325f4ba1992a15`；审查修复提交 `669420d169bea4b26abc788509ed58b7528ecc75`；合并提交待合并后补充。
+- 提交 SHA：原功能提交 `61c042383524580de58493b64a325f4ba1992a15`；审查修复提交 `669420d169bea4b26abc788509ed58b7528ecc75`；合并提交 `3d47c9ced88d8423f50d793f45dec9cd7ea688e1`。
