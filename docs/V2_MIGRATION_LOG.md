@@ -94,7 +94,7 @@ OK
 - 测试命令：`D:\Programme\Anaconda\envs\gitlearnagent\python.exe -B -m unittest tests.test_code_chunker tests.test_database_code_chunks`；`D:\Programme\Anaconda\envs\gitlearnagent\python.exe -B -m unittest discover tests`
 - 测试结果：最小相关测试 16 个通过；完整后端 unittest 24 个通过。
 - 已知限制：仅处理 Python AST 可静态定位的函数和类定义；不分析动态生成符号；未生成 Embedding，未实现混合检索或 RAG；前端暂不展示代码块。
-- 提交 SHA：待提交。
+- 提交 SHA：`0f8ccbcefdbb6f26e49d8cbc84876d248336c1ad`。
 
 ### 2026-06-08 本地 BGE-M3 稠密向量缓存与基础语义检索
 
@@ -102,12 +102,12 @@ OK
 - 模块：本地 BGE-M3 向量生成、缓存与基础语义检索
 - 功能分支：`feat/bge-m3-semantic-retrieval`
 - 修改摘要：新增独立 Embedding 服务、SQLite 向量缓存表、增量索引器和内部语义检索服务；仅实现 dense embedding，不实现关键词融合、BM25、Reranker、AST 关系扩展、RAG 问答改造或前端页面。`EMBEDDING_ENABLED=false` 时旧分析流程不加载模型。
-- 数据库变化：`SCHEMA_VERSION` 升至 3；新增 `code_chunk_embeddings` 表，保存 `code_chunk_id`、`content_hash`、模型标识、文本格式版本、维度、dtype、归一化标记和 float32 little-endian `vector_blob`；通过外键随 `code_chunks` 级联删除；新增批量 upsert、fresh cache 查询、缺失/过期查询和项目向量读取接口。代码块保存逻辑改为尽量保留既有 `code_chunk_id`，以支持未变代码块复用 embedding 缓存。
-- 配置变化：新增 `EMBEDDING_ENABLED`、`EMBEDDING_MODEL_NAME_OR_PATH`、`EMBEDDING_DEVICE`、`EMBEDDING_BATCH_SIZE`、`EMBEDDING_MAX_LENGTH`、`EMBEDDING_NORMALIZE`、`EMBEDDING_CACHE_DIR`、`EMBEDDING_QUERY_PREFIX`、`EMBEDDING_DOCUMENT_PREFIX`。
-- 依赖变化：`backend/requirements.txt` 新增 `sentence-transformers>=3.0,<6.0`；本次没有安装或升级当前 Conda 环境中的 PyTorch，也没有安装向量数据库或 LangChain/LlamaIndex 等框架。
+- 数据库变化：`SCHEMA_VERSION` 升至 4；新增 `code_chunk_embeddings` 表，保存 `code_chunk_id`、`content_hash`、`embedding_input_hash`、模型标识、模型 revision、文本格式版本、`embedding_config_hash`、维度、dtype、归一化标记和 float32 little-endian `vector_blob`；通过外键随 `code_chunks` 级联删除；新增批量 upsert、fresh cache 查询、缺失/过期查询和项目向量读取接口。代码块保存逻辑改为尽量保留既有 `code_chunk_id`，以支持未变代码块复用 embedding 缓存；同一 code chunk 在同一模型/config 下输入变化时清理旧向量，避免缓存无界增长。
+- 配置变化：新增 `EMBEDDING_ENABLED`、`EMBEDDING_MODEL_NAME_OR_PATH`、`EMBEDDING_MODEL_REVISION`、`EMBEDDING_DEVICE`、`EMBEDDING_BATCH_SIZE`、`EMBEDDING_MAX_LENGTH`、`EMBEDDING_NORMALIZE`、`EMBEDDING_CACHE_DIR`、`EMBEDDING_QUERY_PREFIX`、`EMBEDDING_DOCUMENT_PREFIX`。`EMBEDDING_MAX_LENGTH` 运行时限制为 16 到 8192。
+- 依赖变化：`backend/requirements.txt` 新增并收窄为 `sentence-transformers>=3.0,<4.0`；真实隔离环境解析到 Python 3.12.13、torch 2.12.0+cpu、sentence-transformers 3.4.1、transformers 4.57.6、tokenizers 0.22.2。本次没有安装或升级原 `gitlearnagent` Conda 环境中的 PyTorch，也没有安装向量数据库或 LangChain/LlamaIndex 等框架。
 - 模型下载边界：默认模型名为 `BAAI/bge-m3`，也支持用户配置本地模型目录；模型延迟加载，不在导入模块或应用启动时加载；缓存目录来自配置，默认 `embedding_cache`，已由 `.gitignore` 排除；单元测试使用 Fake backend，不下载真实模型。
-- 测试命令：`D:\Programme\Anaconda\envs\gitlearnagent\python.exe -B -m unittest tests.test_embedding_service tests.test_database_embeddings tests.test_embedding_indexer tests.test_semantic_retriever`；`D:\Programme\Anaconda\envs\gitlearnagent\python.exe -B -m unittest discover tests`。
-- 测试结果：新增确定性测试 42 个通过；完整后端 unittest 70 个通过。完整测试首次运行发现旧 schema version 测试硬编码为 2，已更新为引用当前 `SCHEMA_VERSION` 后通过。
-- 是否执行真实 BGE-M3 smoke test：未执行。指定 Conda 环境当前没有 `torch`、`sentence-transformers` 或 `numpy`，且本次未获得安装/下载真实模型授权。
-- 已知限制：第一版从 SQLite 读取项目向量后在内存中点积排序，适合中小型仓库；未使用 FAISS/Chroma 等外部向量库；长代码块按固定文本格式交给模型，实际截断由 Sentence Transformers/max length 处理；本地模型目录内容变更不会自动生成内容级模型 revision；语义检索尚未接入问答、学习路线或前端。
-- 提交 SHA：待提交。
+- 测试命令：`D:\Programme\Anaconda\envs\gitlearnagent\python.exe -B -m unittest tests.test_embedding_service tests.test_database_embeddings tests.test_embedding_indexer tests.test_semantic_retriever`；`D:\Programme\Anaconda\envs\gitlearnagent\python.exe -B -m unittest discover tests`；`D:\Programme\Anaconda\envs\gitlearnagent-v2-embed-smoke\python.exe tests\smoke_bge_m3.py`。
+- 测试结果：审查修复后 embedding 相关确定性测试 61 个通过；完整后端 unittest 89 个通过。真实 BGE-M3 smoke test 在隔离环境 `gitlearnagent-v2-embed-smoke` 中通过，设备为 CPU，模型 `BAAI/bge-m3` resolved revision 为 `5617a9f61b028005a4858fdac845db406aefb181`，输出 1024 维 float32，文档和查询向量范数约为 1。中文查询“用户身份是如何验证的？”排序为 `authenticate_user`、`initialize_database`、`upload_file`；SQLite 集成链路验证首次生成 3 个向量、第二次 3 个全部命中缓存、修改认证代码块后仅重算 1 个、检索返回 `src/auth.py` 的 `authenticate_user` 10-12 行。
+- 是否执行真实 BGE-M3 smoke test：已执行。首次下载/加载写入已忽略的 `embedding_cache\bge_m3_smoke`，未下载本地 7B，未修改原 Conda 环境。首次模型加载约 897954 ms；缓存后复跑加载约 12857 ms；文档编码约 2537 ms，查询编码约 478 ms。进程内存占用未能可靠获取。
+- 已知限制：第一版从 SQLite 读取项目向量后在内存中点积排序，适合中小型仓库；未使用 FAISS/Chroma 等外部向量库；长代码块按固定文本格式交给模型，实际截断由 Sentence Transformers/max length 处理；本地模型目录只记录目录路径标识，尚未做模型文件内容级指纹，也不会扫描并哈希数 GB 模型文件；语义检索尚未接入问答、学习路线或前端。真实依赖安装时本机 pip 配置使用 `https://pypi.tuna.tsinghua.edu.cn/simple` 镜像。
+- 提交 SHA：原功能提交 `61c042383524580de58493b64a325f4ba1992a15`；审查修复提交 `669420d169bea4b26abc788509ed58b7528ecc75`；合并提交待合并后补充。
