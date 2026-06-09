@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.database import Database
+from app.database import Database, SCHEMA_VERSION
 
 
 def _project_id(db: Database) -> str:
@@ -103,7 +103,7 @@ class DatabaseCodeChunkTests(unittest.TestCase):
                     SET version = ?, updated_at = ?
                     WHERE key = ?
                     """,
-                    (2, "fixed-timestamp", "database"),
+                    (SCHEMA_VERSION, "fixed-timestamp", "database"),
                 )
 
             reopened = Database(path)
@@ -113,7 +113,7 @@ class DatabaseCodeChunkTests(unittest.TestCase):
                     ("database",),
                 ).fetchone()
 
-            self.assertEqual(row["version"], 2)
+            self.assertEqual(row["version"], SCHEMA_VERSION)
             self.assertEqual(row["updated_at"], "fixed-timestamp")
 
     def test_code_chunk_foreign_key_is_enabled_and_cascades(self):

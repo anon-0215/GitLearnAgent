@@ -7,10 +7,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app.config import get_env_value, load_environment
+from app.config import get_embedding_settings, get_env_value, load_environment
 from app.database import Database
-from app.services.code_chunker import extract_python_code_chunks_from_files
 from app.services.analyzer import analyze_snapshot
+from app.services.code_chunker import extract_python_code_chunks_from_files
+from app.services.embedding_indexer import EmbeddingIndexer
+from app.services.embedding_service import EmbeddingService
 from app.services.github_client import fetch_repository
 from app.services.learning_agent import build_learning_path
 from app.services.llm_client import LLMClient
@@ -31,6 +33,7 @@ app.add_middleware(
 
 db = Database()
 llm = LLMClient()
+embedding_service = EmbeddingService(get_embedding_settings())
 
 
 class AnalyzeRequest(BaseModel):
@@ -43,10 +46,16 @@ class AskRequest(BaseModel):
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
+    embedding_identity = embedding_service.get_model_identity()
     return {
         "ok": True,
         "llm_available": llm.available,
         "github_token_configured": bool(get_env_value("GITHUB_TOKEN")),
+        "embedding_enabled": embedding_service.settings.enabled,
+        "embedding_available": embedding_service.is_available(),
+        "embedding_model": embedding_identity.model_name,
+        "embedding_model_revision": embedding_identity.model_revision,
+        "embedding_device": embedding_identity.device,
         "database": str(Path(db.path)),
     }
 
@@ -59,6 +68,7 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     project_id = db.create_project(snapshot.to_dict())
+    embedding_index: dict[str, Any] | None = None
     try:
         analysis = analyze_snapshot(snapshot)
         chunk_result = extract_python_code_chunks_from_files(
@@ -86,11 +96,24 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
             learning_steps,
             [chunk.to_dict() for chunk in chunk_result.chunks],
         )
+        if embedding_service.settings.enabled:
+            try:
+                embedding_index = EmbeddingIndexer(db, embedding_service).index_project(
+                    project_id
+                ).to_dict()
+            except Exception as exc:
+                embedding_index = {
+                    "status": "warning",
+                    "warnings": [f"Embedding indexing failed after analysis was saved: {exc}"],
+                }
     except Exception as exc:
         db.mark_failed(project_id, str(exc))
         raise HTTPException(status_code=500, detail=f"分析失败：{exc}") from exc
 
-    return {"project_id": project_id, "status": "done"}
+    response: dict[str, Any] = {"project_id": project_id, "status": "done"}
+    if embedding_index is not None:
+        response["embedding_index"] = embedding_index
+    return response
 
 
 @app.get("/api/projects/{project_id}")

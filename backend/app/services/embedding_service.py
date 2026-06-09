@@ -1,0 +1,453 @@
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import math
+import re
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from threading import RLock
+from typing import Any, Callable, Protocol, Sequence
+
+from app.config import EmbeddingSettings, clamp_embedding_max_length, get_embedding_settings
+from app.database import _as_float32
+
+
+CODE_CHUNK_TEXT_FORMAT_VERSION = "code-chunk-v1"
+EMBEDDING_CONFIG_HASH_VERSION = "embedding-config-v1"
+
+
+class EmbeddingError(RuntimeError):
+    pass
+
+
+class EmbeddingConfigurationError(EmbeddingError):
+    pass
+
+
+class EmbeddingModelLoadError(EmbeddingError):
+    pass
+
+
+class EmbeddingEncodeError(EmbeddingError):
+    pass
+
+
+@dataclass(frozen=True)
+class EmbeddingModelIdentity:
+    model_name: str
+    model_revision: str
+    device: str
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+class EmbeddingBackend(Protocol):
+    def load_model(
+        self,
+        model_name_or_path: str,
+        device: str,
+        cache_dir: Path,
+        max_length: int,
+        model_revision: str,
+    ) -> None:
+        ...
+
+    def encode(
+        self,
+        texts: Sequence[str],
+        batch_size: int,
+        normalize: bool,
+    ) -> Any:
+        ...
+
+    def get_embedding_dimension(self) -> int | None:
+        ...
+
+    def get_model_revision(self) -> str | None:
+        ...
+
+    def unload_model(self) -> None:
+        ...
+
+
+class SentenceTransformerEmbeddingBackend:
+    def __init__(self) -> None:
+        self._model: Any | None = None
+        self._resolved_revision: str | None = None
+
+    def load_model(
+        self,
+        model_name_or_path: str,
+        device: str,
+        cache_dir: Path,
+        max_length: int,
+        model_revision: str = "",
+    ) -> None:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise EmbeddingModelLoadError(
+                "sentence-transformers is not installed; install backend requirements "
+                "before enabling embeddings."
+            ) from exc
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        kwargs: dict[str, Any] = {
+            "device": device,
+            "cache_folder": str(cache_dir),
+        }
+        if model_revision:
+            kwargs["revision"] = model_revision
+        model = SentenceTransformer(
+            model_name_or_path,
+            **kwargs,
+        )
+        if max_length > 0 and hasattr(model, "max_seq_length"):
+            model.max_seq_length = max_length
+        self._model = model
+        self._resolved_revision = (
+            _extract_sentence_transformer_revision(model) or model_revision
+        )
+
+    def encode(
+        self,
+        texts: Sequence[str],
+        batch_size: int,
+        normalize: bool,
+    ) -> Any:
+        if self._model is None:
+            raise EmbeddingModelLoadError("embedding model is not loaded")
+        return self._model.encode(
+            list(texts),
+            batch_size=batch_size,
+            normalize_embeddings=normalize,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+
+    def get_embedding_dimension(self) -> int | None:
+        if self._model is None:
+            return None
+        dimension = self._model.get_sentence_embedding_dimension()
+        return int(dimension) if dimension else None
+
+    def get_model_revision(self) -> str | None:
+        if self._model is None:
+            return None
+        return self._resolved_revision or None
+
+    def unload_model(self) -> None:
+        self._model = None
+        self._resolved_revision = None
+
+
+class EmbeddingService:
+    def __init__(
+        self,
+        settings: EmbeddingSettings | None = None,
+        backend_factory: Callable[[], EmbeddingBackend] | None = None,
+        cuda_available: Callable[[], bool] | None = None,
+    ) -> None:
+        self.settings = settings or get_embedding_settings()
+        self._backend_is_injected = backend_factory is not None
+        self._backend_factory = backend_factory or SentenceTransformerEmbeddingBackend
+        self._cuda_available = cuda_available or _torch_cuda_available
+        self._backend: EmbeddingBackend | None = None
+        self._identity: EmbeddingModelIdentity | None = None
+        self._dimension: int | None = None
+        self._lock = RLock()
+
+    def load_model(self) -> None:
+        with self._lock:
+            if self._backend is not None:
+                return
+            if not self.settings.enabled:
+                raise EmbeddingConfigurationError("embeddings are disabled by EMBEDDING_ENABLED")
+            device = resolve_embedding_device(self.settings.device, self._cuda_available)
+            identity = build_model_identity(
+                self.settings.model_name_or_path,
+                device,
+                self.settings.model_revision,
+            )
+            backend = self._backend_factory()
+            try:
+                backend.load_model(
+                    self.settings.model_name_or_path,
+                    device,
+                    self.settings.cache_dir,
+                    clamp_embedding_max_length(self.settings.max_length),
+                    self.settings.model_revision,
+                )
+            except EmbeddingError:
+                raise
+            except Exception as exc:
+                raise EmbeddingModelLoadError(
+                    f"failed to load embedding model {identity.model_name} on {device}"
+                ) from exc
+            resolved_revision = _backend_model_revision(backend) or identity.model_revision
+            self._backend = backend
+            self._identity = EmbeddingModelIdentity(
+                identity.model_name,
+                resolved_revision,
+                identity.device,
+            )
+            self._dimension = backend.get_embedding_dimension()
+
+    def encode_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        prefixed = [self.settings.document_prefix + text for text in texts]
+        return self._encode(prefixed, "documents")
+
+    def encode_query(self, text: str) -> list[float]:
+        query = text.strip()
+        if not query:
+            raise EmbeddingEncodeError("embedding query must not be empty")
+        return self._encode([self.settings.query_prefix + query], "query")[0]
+
+    def get_model_identity(self) -> EmbeddingModelIdentity:
+        if self._identity is not None:
+            return self._identity
+        device = (
+            self.settings.device
+            if self.settings.device != "auto"
+            else ("cuda" if self._cuda_available() else "cpu")
+        )
+        return build_model_identity(
+            self.settings.model_name_or_path,
+            device,
+            self.settings.model_revision,
+        )
+
+    def ensure_model_identity(self) -> EmbeddingModelIdentity:
+        if _needs_loaded_revision(self.settings) and self._identity is None:
+            self.load_model()
+        return self.get_model_identity()
+
+    def get_embedding_dimension(self) -> int | None:
+        if self._dimension is None:
+            self.load_model()
+        return self._dimension
+
+    def unload_model(self) -> None:
+        with self._lock:
+            if self._backend is not None:
+                self._backend.unload_model()
+            self._backend = None
+            self._identity = None
+            self._dimension = None
+
+    def is_available(self) -> bool:
+        if not self.settings.enabled:
+            return False
+        if self._backend is not None:
+            return True
+        if self._backend_is_injected:
+            return True
+        return importlib.util.find_spec("sentence_transformers") is not None
+
+    def _encode(self, texts: Sequence[str], operation: str) -> list[list[float]]:
+        with self._lock:
+            self.load_model()
+            assert self._backend is not None
+            identity = self.get_model_identity()
+            try:
+                raw_vectors = self._backend.encode(
+                    texts,
+                    batch_size=self.settings.batch_size,
+                    normalize=self.settings.normalize,
+                )
+            except EmbeddingError:
+                raise
+            except Exception as exc:
+                raise EmbeddingEncodeError(
+                    f"failed to encode {len(texts)} {operation} with {identity.model_name}"
+                ) from exc
+            vectors = coerce_embedding_batch(raw_vectors, self.settings.normalize)
+            if len(vectors) != len(texts):
+                raise EmbeddingEncodeError(
+                    f"embedding backend returned {len(vectors)} vectors for "
+                    f"{len(texts)} {operation}"
+                )
+            if vectors:
+                dimension = len(vectors[0])
+                if any(len(vector) != dimension for vector in vectors):
+                    raise EmbeddingEncodeError("embedding backend returned inconsistent dimensions")
+                self._dimension = dimension
+            return vectors
+
+
+def build_code_chunk_document_text(chunk: dict[str, Any]) -> str:
+    path = str(chunk.get("path", "")).replace("\\", "/").lstrip("/")
+    chunk_type = str(chunk.get("chunk_type", ""))
+    symbol = str(chunk.get("qualified_name") or chunk.get("symbol_name") or "")
+    content = str(chunk.get("content", ""))
+    return "\n".join(
+        [
+            f"format: {CODE_CHUNK_TEXT_FORMAT_VERSION}",
+            f"path: {path}",
+            f"type: {chunk_type}",
+            f"symbol: {symbol}",
+            "code:",
+            content,
+        ]
+    )
+
+
+def resolve_embedding_device(
+    requested_device: str,
+    cuda_available: Callable[[], bool] | None = None,
+) -> str:
+    requested = (requested_device or "auto").lower()
+    has_cuda = (cuda_available or _torch_cuda_available)()
+    if requested == "auto":
+        return "cuda" if has_cuda else "cpu"
+    if requested == "cpu":
+        return "cpu"
+    if requested == "cuda" or requested.startswith("cuda:"):
+        if not has_cuda:
+            raise EmbeddingConfigurationError(
+                f"EMBEDDING_DEVICE={requested_device} was requested, but CUDA is not available"
+            )
+        return requested
+    raise EmbeddingConfigurationError(f"unsupported EMBEDDING_DEVICE value: {requested_device}")
+
+
+def build_model_identity(
+    model_name_or_path: str,
+    device: str,
+    model_revision: str = "",
+) -> EmbeddingModelIdentity:
+    raw = model_name_or_path.strip() or "BAAI/bge-m3"
+    configured_revision = model_revision.strip()
+    path = Path(raw)
+    looks_local = path.exists() or path.is_absolute() or "\\" in raw or raw.startswith(".")
+    if looks_local:
+        resolved = path.expanduser().resolve(strict=False)
+        digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+        safe_name = f"local:{resolved.name or 'embedding-model'}"
+        revision = f"path-sha256:{digest}"
+        if configured_revision:
+            revision = f"{revision}:configured-revision:{configured_revision}"
+        return EmbeddingModelIdentity(safe_name, revision, device)
+    return EmbeddingModelIdentity(raw, configured_revision, device)
+
+
+def build_embedding_config_hash(settings: EmbeddingSettings) -> str:
+    payload = {
+        "version": EMBEDDING_CONFIG_HASH_VERSION,
+        "text_format_version": CODE_CHUNK_TEXT_FORMAT_VERSION,
+        "query_prefix": settings.query_prefix,
+        "document_prefix": settings.document_prefix,
+        "max_length": clamp_embedding_max_length(settings.max_length),
+        "normalize": bool(settings.normalize),
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_embedding_input_hash(final_embedding_text: str) -> str:
+    return hashlib.sha256(final_embedding_text.encode("utf-8")).hexdigest()
+
+
+def build_code_chunk_embedding_input_hash(
+    chunk: dict[str, Any],
+    settings: EmbeddingSettings,
+) -> str:
+    final_text = settings.document_prefix + build_code_chunk_document_text(chunk)
+    return build_embedding_input_hash(final_text)
+
+
+def coerce_embedding_batch(raw_vectors: Any, normalize: bool) -> list[list[float]]:
+    if hasattr(raw_vectors, "tolist"):
+        raw_vectors = raw_vectors.tolist()
+    if raw_vectors is None:
+        return []
+    vectors = list(raw_vectors)
+    if not vectors:
+        return []
+    if vectors and not isinstance(vectors[0], (list, tuple)):
+        vectors = [vectors]
+    coerced = [_coerce_vector(vector) for vector in vectors]
+    return [_normalize_vector(vector) for vector in coerced] if normalize else coerced
+
+
+def _coerce_vector(vector: Sequence[float]) -> list[float]:
+    values = [_as_float32(value) for value in vector]
+    if not values:
+        raise EmbeddingEncodeError("embedding backend returned an empty vector")
+    return values
+
+
+def _normalize_vector(vector: Sequence[float]) -> list[float]:
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm == 0:
+        return [_as_float32(value) for value in vector]
+    return [_as_float32(value / norm) for value in vector]
+
+
+def _torch_cuda_available() -> bool:
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(torch.cuda.is_available())
+
+
+def _needs_loaded_revision(settings: EmbeddingSettings) -> bool:
+    if settings.model_revision.strip():
+        return False
+    raw = settings.model_name_or_path.strip()
+    path = Path(raw)
+    looks_local = path.exists() or path.is_absolute() or "\\" in raw or raw.startswith(".")
+    return bool(raw) and not looks_local
+
+
+def _backend_model_revision(backend: EmbeddingBackend) -> str | None:
+    getter = getattr(backend, "get_model_revision", None)
+    if getter is None:
+        return None
+    try:
+        revision = getter()
+    except Exception:
+        return None
+    return str(revision).strip() or None
+
+
+def _extract_sentence_transformer_revision(model: Any) -> str | None:
+    objects: list[Any] = [model]
+    modules = getattr(model, "_modules", None)
+    if isinstance(modules, dict):
+        objects.extend(modules.values())
+    for item in list(objects):
+        objects.extend(
+            candidate
+            for candidate in (
+                getattr(item, "auto_model", None),
+                getattr(item, "tokenizer", None),
+            )
+            if candidate is not None
+        )
+
+    for item in objects:
+        config = getattr(item, "config", None)
+        commit_hash = getattr(config, "_commit_hash", None)
+        if commit_hash:
+            return str(commit_hash)
+        init_kwargs = getattr(item, "init_kwargs", None)
+        if isinstance(init_kwargs, dict) and init_kwargs.get("_commit_hash"):
+            return str(init_kwargs["_commit_hash"])
+        for attr in ("name_or_path", "_name_or_path"):
+            value = getattr(item, attr, None)
+            commit_hash = _commit_from_cache_path(str(value)) if value else None
+            if commit_hash:
+                return commit_hash
+    return None
+
+
+def _commit_from_cache_path(value: str) -> str | None:
+    match = re.search(r"[\\/]+snapshots[\\/]+([0-9a-f]{40})(?:[\\/]|$)", value)
+    return match.group(1) if match else None

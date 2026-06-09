@@ -171,6 +171,16 @@ https://github.com/tiangolo/fastapi
 | `LLM_BASE_URL` | 否 | OpenAI 兼容接口地址，例如 DeepSeek、通义、智谱等服务的 base URL。 |
 | `LLM_API_KEY` | 否 | 大模型 API Key。未配置时，系统使用本地规则生成学习路线和问答结果。 |
 | `LLM_MODEL` | 否 | 模型名称，默认可使用 `deepseek-chat` 一类 OpenAI 兼容模型名。 |
+| `EMBEDDING_ENABLED` | 否 | V2 稠密向量能力开关，默认 `false`，避免首次启动自动下载大型模型。 |
+| `EMBEDDING_MODEL_NAME_OR_PATH` | 否 | Sentence Transformers 模型名或本地模型目录，默认 `BAAI/bge-m3`。 |
+| `EMBEDDING_MODEL_REVISION` | 否 | Hugging Face 模型 revision 或 commit。建议生产环境填写固定 commit；本地目录模型不会扫描模型文件内容做指纹。 |
+| `EMBEDDING_DEVICE` | 否 | `auto`、`cpu` 或 `cuda`。`cuda` 不可用时会明确报错。 |
+| `EMBEDDING_BATCH_SIZE` | 否 | Embedding 批量编码大小，默认 `8`。 |
+| `EMBEDDING_MAX_LENGTH` | 否 | 模型最大文本长度，默认 `8192`，运行时限制在 `16` 到 `8192`。 |
+| `EMBEDDING_NORMALIZE` | 否 | 是否保存 L2 归一化向量，默认 `true`。 |
+| `EMBEDDING_CACHE_DIR` | 否 | Sentence Transformers 模型缓存目录，默认 `embedding_cache`。 |
+| `EMBEDDING_QUERY_PREFIX` | 否 | 查询文本前缀，可为空。 |
+| `EMBEDDING_DOCUMENT_PREFIX` | 否 | 代码块文档文本前缀，可为空。 |
 | `VITE_API_BASE_URL` | 否 | 前端请求后端的地址，默认 `http://127.0.0.1:8000`。 |
 
 `.env.example` 示例：
@@ -180,8 +190,31 @@ GITHUB_TOKEN=
 LLM_BASE_URL=https://api.deepseek.com
 LLM_API_KEY=
 LLM_MODEL=deepseek-chat
+EMBEDDING_ENABLED=false
+EMBEDDING_MODEL_NAME_OR_PATH=BAAI/bge-m3
+EMBEDDING_MODEL_REVISION=
+EMBEDDING_DEVICE=auto
+EMBEDDING_BATCH_SIZE=8
+EMBEDDING_MAX_LENGTH=8192
+EMBEDDING_NORMALIZE=true
+EMBEDDING_CACHE_DIR=embedding_cache
+EMBEDDING_QUERY_PREFIX=
+EMBEDDING_DOCUMENT_PREFIX=
 VITE_API_BASE_URL=http://127.0.0.1:8000
 ```
+
+启用 BGE-M3 前，请先在后端 Python 环境中安装 `sentence-transformers`
+和兼容的 PyTorch。系统不会在应用启动时自动加载模型；只有
+`EMBEDDING_ENABLED=true` 且分析代码块保存完成后，才会尝试建立
+SQLite 向量缓存。真实模型可来自 Hugging Face 名称 `BAAI/bge-m3`，
+也可以来自用户配置的本地模型目录。
+
+向量缓存命中会同时校验 code chunk、源码内容哈希、最终 embedding
+输入哈希、模型名称、模型 revision、文本格式版本、prefix/max length
+等配置身份和 normalized 设置。Hugging Face 模型会优先记录显式配置
+的 revision，并在真实加载后尽量读取 resolved commit；如果使用本地
+模型目录，当前只记录目录路径标识，不会为了启动速度去哈希数 GB 的
+模型文件。
 
 ## GitHub Token 说明
 

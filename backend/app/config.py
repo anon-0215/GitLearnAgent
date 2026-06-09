@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
+EMBEDDING_MAX_LENGTH_MIN = 16
+EMBEDDING_MAX_LENGTH_MAX = 8192
 
 
 def load_environment() -> None:
@@ -20,6 +23,8 @@ def load_environment() -> None:
 
 
 def get_env_value(key: str, default: str = "") -> str:
+    if key in os.environ:
+        return os.environ[key]
     for env_path in (BACKEND_ROOT / ".env", PROJECT_ROOT / ".env"):
         if not env_path.exists():
             continue
@@ -29,9 +34,69 @@ def get_env_value(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
 
+@dataclass(frozen=True)
+class EmbeddingSettings:
+    enabled: bool
+    model_name_or_path: str
+    device: str
+    batch_size: int
+    max_length: int
+    normalize: bool
+    cache_dir: Path
+    query_prefix: str
+    document_prefix: str
+    model_revision: str = ""
+
+
+def get_embedding_settings() -> EmbeddingSettings:
+    cache_dir = _env_path("EMBEDDING_CACHE_DIR", PROJECT_ROOT / "embedding_cache")
+    return EmbeddingSettings(
+        enabled=_env_bool("EMBEDDING_ENABLED", False),
+        model_name_or_path=get_env_value("EMBEDDING_MODEL_NAME_OR_PATH", "BAAI/bge-m3").strip()
+        or "BAAI/bge-m3",
+        device=(get_env_value("EMBEDDING_DEVICE", "auto").strip() or "auto").lower(),
+        batch_size=max(1, _env_int("EMBEDDING_BATCH_SIZE", 8)),
+        max_length=clamp_embedding_max_length(_env_int("EMBEDDING_MAX_LENGTH", 8192)),
+        normalize=_env_bool("EMBEDDING_NORMALIZE", True),
+        cache_dir=cache_dir,
+        query_prefix=get_env_value("EMBEDDING_QUERY_PREFIX", ""),
+        document_prefix=get_env_value("EMBEDDING_DOCUMENT_PREFIX", ""),
+        model_revision=get_env_value("EMBEDDING_MODEL_REVISION", "").strip(),
+    )
+
+
+def clamp_embedding_max_length(value: int) -> int:
+    return min(EMBEDDING_MAX_LENGTH_MAX, max(EMBEDDING_MAX_LENGTH_MIN, int(value)))
+
+
 def _load_env_file(path: Path) -> None:
     for key, value in _read_env_file(path).items():
         os.environ.setdefault(key, value)
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    value = get_env_value(key, str(default)).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off", ""}:
+        return False
+    return default
+
+
+def _env_int(key: str, default: int) -> int:
+    value = get_env_value(key, str(default)).strip()
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_path(key: str, default: Path) -> Path:
+    value = get_env_value(key, str(default)).strip()
+    path = Path(value) if value else default
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
