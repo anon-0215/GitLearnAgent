@@ -9,7 +9,11 @@ from app.services.embedding_service import (
     EmbeddingConfigurationError,
     EmbeddingEncodeError,
     EmbeddingService,
+    build_code_chunk_embedding_input_hash,
     build_code_chunk_document_text,
+    build_embedding_config_hash,
+    build_embedding_input_hash,
+    build_model_identity,
 )
 
 
@@ -24,6 +28,7 @@ def _settings(**overrides):
         "cache_dir": Path("embedding-cache"),
         "query_prefix": "",
         "document_prefix": "",
+        "model_revision": "fake-revision",
     }
     values.update(overrides)
     return EmbeddingSettings(**values)
@@ -37,12 +42,13 @@ class FakeEmbeddingBackend:
         self.encode_calls = []
         self.loaded_device = None
 
-    def load_model(self, model_name_or_path, device, cache_dir, max_length):
+    def load_model(self, model_name_or_path, device, cache_dir, max_length, model_revision):
         self.load_calls += 1
         self.loaded_device = device
         self.loaded_model = model_name_or_path
         self.loaded_cache_dir = cache_dir
         self.loaded_max_length = max_length
+        self.loaded_model_revision = model_revision
 
     def encode(self, texts, batch_size, normalize):
         self.encode_calls.append((list(texts), batch_size, normalize))
@@ -52,6 +58,9 @@ class FakeEmbeddingBackend:
 
     def get_embedding_dimension(self):
         return 2
+
+    def get_model_revision(self):
+        return self.loaded_model_revision
 
     def unload_model(self):
         self.loaded_device = None
@@ -134,6 +143,39 @@ class EmbeddingServiceTests(unittest.TestCase):
 
         self.assertEqual(len(vectors), 2)
         self.assertEqual(backend.encode_calls[0][1], 7)
+
+    def test_configured_model_revision_is_passed_to_backend_and_identity(self):
+        backend = FakeEmbeddingBackend()
+        service = EmbeddingService(
+            _settings(model_revision="commit-abc"),
+            backend_factory=lambda: backend,
+            cuda_available=lambda: False,
+        )
+
+        service.load_model()
+
+        self.assertEqual(backend.loaded_model_revision, "commit-abc")
+        self.assertEqual(service.get_model_identity().model_revision, "commit-abc")
+
+    def test_max_length_is_clamped_before_loading_backend(self):
+        low_backend = FakeEmbeddingBackend()
+        low_service = EmbeddingService(
+            _settings(max_length=1),
+            backend_factory=lambda: low_backend,
+            cuda_available=lambda: False,
+        )
+        high_backend = FakeEmbeddingBackend()
+        high_service = EmbeddingService(
+            _settings(max_length=999999),
+            backend_factory=lambda: high_backend,
+            cuda_available=lambda: False,
+        )
+
+        low_service.load_model()
+        high_service.load_model()
+
+        self.assertEqual(low_backend.loaded_max_length, 16)
+        self.assertEqual(high_backend.loaded_max_length, 8192)
 
     def test_outputs_are_float32_values(self):
         backend = FakeEmbeddingBackend(lambda text: [1.0 / 3.0, 2.0 / 3.0])
@@ -221,6 +263,35 @@ class EmbeddingServiceTests(unittest.TestCase):
                 ]
             ),
         )
+
+    def test_embedding_input_hash_uses_final_prefixed_text(self):
+        chunk = {
+            "path": "app/auth.py",
+            "chunk_type": "function",
+            "qualified_name": "authenticate_user",
+            "content": "def authenticate_user():\n    return True\n",
+        }
+        settings = _settings(document_prefix="passage: ")
+        document_text = build_code_chunk_document_text(chunk)
+
+        self.assertEqual(
+            build_code_chunk_embedding_input_hash(chunk, settings),
+            build_embedding_input_hash("passage: " + document_text),
+        )
+
+    def test_embedding_config_hash_changes_with_prefix_max_length_and_normalize(self):
+        base = build_embedding_config_hash(_settings())
+
+        self.assertNotEqual(base, build_embedding_config_hash(_settings(document_prefix="doc: ")))
+        self.assertNotEqual(base, build_embedding_config_hash(_settings(query_prefix="query: ")))
+        self.assertNotEqual(base, build_embedding_config_hash(_settings(max_length=256)))
+        self.assertNotEqual(base, build_embedding_config_hash(_settings(normalize=False)))
+
+    def test_remote_model_identity_includes_configured_revision(self):
+        identity = build_model_identity("BAAI/bge-m3", "cpu", "abc123")
+
+        self.assertEqual(identity.model_name, "BAAI/bge-m3")
+        self.assertEqual(identity.model_revision, "abc123")
 
 
 if __name__ == "__main__":

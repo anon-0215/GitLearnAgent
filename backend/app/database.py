@@ -13,7 +13,7 @@ from typing import Any, Sequence
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "gitlearn.sqlite"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 SCHEMA = """
@@ -109,9 +109,11 @@ CREATE TABLE IF NOT EXISTS code_chunk_embeddings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     code_chunk_id INTEGER NOT NULL,
     content_hash TEXT NOT NULL,
+    embedding_input_hash TEXT NOT NULL,
     model_name TEXT NOT NULL,
     model_revision TEXT NOT NULL DEFAULT '',
     text_format_version TEXT NOT NULL,
+    embedding_config_hash TEXT NOT NULL DEFAULT '',
     embedding_dimension INTEGER NOT NULL,
     embedding_dtype TEXT NOT NULL DEFAULT 'float32',
     normalized INTEGER NOT NULL DEFAULT 1,
@@ -133,15 +135,6 @@ ON code_chunks (project_id, path);
 CREATE INDEX IF NOT EXISTS idx_code_chunks_project_symbol
 ON code_chunks (project_id, qualified_name);
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_code_chunk_embeddings_unique
-ON code_chunk_embeddings (
-    code_chunk_id, content_hash, model_name, model_revision, text_format_version
-);
-
-CREATE INDEX IF NOT EXISTS idx_code_chunk_embeddings_lookup
-ON code_chunk_embeddings (
-    model_name, model_revision, text_format_version, content_hash
-);
 """
 
 
@@ -176,6 +169,7 @@ class Database:
     def _init_schema(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate_schema(conn)
             conn.execute(
                 "INSERT OR IGNORE INTO schema_versions (key, version) VALUES (?, ?)",
                 ("database", SCHEMA_VERSION),
@@ -189,6 +183,46 @@ class Database:
                 """,
                 (SCHEMA_VERSION, "database", SCHEMA_VERSION),
             )
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        embedding_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(code_chunk_embeddings)").fetchall()
+        }
+        if "embedding_input_hash" not in embedding_columns:
+            conn.execute(
+                """
+                ALTER TABLE code_chunk_embeddings
+                ADD COLUMN embedding_input_hash TEXT NOT NULL DEFAULT ''
+                """
+            )
+        if "embedding_config_hash" not in embedding_columns:
+            conn.execute(
+                """
+                ALTER TABLE code_chunk_embeddings
+                ADD COLUMN embedding_config_hash TEXT NOT NULL DEFAULT ''
+                """
+            )
+        conn.execute("DROP INDEX IF EXISTS idx_code_chunk_embeddings_unique")
+        conn.execute("DROP INDEX IF EXISTS idx_code_chunk_embeddings_lookup")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_code_chunk_embeddings_unique
+            ON code_chunk_embeddings (
+                code_chunk_id, embedding_input_hash, model_name, model_revision,
+                text_format_version, embedding_config_hash, normalized
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_code_chunk_embeddings_lookup
+            ON code_chunk_embeddings (
+                model_name, model_revision, text_format_version,
+                embedding_config_hash, normalized, content_hash
+            )
+            """
+        )
 
     def create_project(self, snapshot: dict[str, Any]) -> str:
         project_id = str(uuid.uuid4())
@@ -374,27 +408,86 @@ class Database:
         model_name: str,
         model_revision: str,
         text_format_version: str,
+        embedding_config_hash: str = "",
+        normalized: bool = True,
+        embedding_input_hashes: dict[int, str] | None = None,
     ) -> list[dict[str, Any]]:
         with self.connect() as conn:
+            if embedding_input_hashes is None:
+                rows = conn.execute(
+                    """
+                    SELECT c.*
+                    FROM code_chunks c
+                    WHERE c.project_id = ?
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM code_chunk_embeddings e
+                        WHERE e.code_chunk_id = c.id
+                          AND e.content_hash = c.content_hash
+                          AND e.model_name = ?
+                          AND e.model_revision = ?
+                          AND e.text_format_version = ?
+                          AND e.embedding_config_hash = ?
+                          AND e.normalized = ?
+                      )
+                    ORDER BY c.path, c.start_line, c.id
+                    """,
+                    (
+                        project_id,
+                        model_name,
+                        model_revision,
+                        text_format_version,
+                        embedding_config_hash,
+                        1 if normalized else 0,
+                    ),
+                ).fetchall()
+                return [self._code_chunk_from_row(row) for row in rows]
+
             rows = conn.execute(
                 """
                 SELECT c.*
                 FROM code_chunks c
                 WHERE c.project_id = ?
-                  AND NOT EXISTS (
+                ORDER BY c.path, c.start_line, c.id
+                """,
+                (project_id,),
+            ).fetchall()
+            chunks = [self._code_chunk_from_row(row) for row in rows]
+            stale: list[dict[str, Any]] = []
+            for chunk in chunks:
+                chunk_id = int(chunk["id"])
+                expected_input_hash = embedding_input_hashes.get(chunk_id)
+                if not expected_input_hash:
+                    stale.append(chunk)
+                    continue
+                fresh = conn.execute(
+                    """
                     SELECT 1
                     FROM code_chunk_embeddings e
-                    WHERE e.code_chunk_id = c.id
-                      AND e.content_hash = c.content_hash
+                    WHERE e.code_chunk_id = ?
+                      AND e.content_hash = ?
+                      AND e.embedding_input_hash = ?
                       AND e.model_name = ?
                       AND e.model_revision = ?
                       AND e.text_format_version = ?
-                  )
-                ORDER BY c.path, c.start_line, c.id
-                """,
-                (project_id, model_name, model_revision, text_format_version),
-            ).fetchall()
-        return [self._code_chunk_from_row(row) for row in rows]
+                      AND e.embedding_config_hash = ?
+                      AND e.normalized = ?
+                    LIMIT 1
+                    """,
+                    (
+                        chunk_id,
+                        chunk["content_hash"],
+                        expected_input_hash,
+                        model_name,
+                        model_revision,
+                        text_format_version,
+                        embedding_config_hash,
+                        1 if normalized else 0,
+                    ),
+                ).fetchone()
+                if fresh is None:
+                    stale.append(chunk)
+            return stale
 
     def get_fresh_embedding_dimensions_for_project(
         self,
@@ -402,6 +495,8 @@ class Database:
         model_name: str,
         model_revision: str,
         text_format_version: str,
+        embedding_config_hash: str = "",
+        normalized: bool = True,
     ) -> list[int]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -414,9 +509,18 @@ class Database:
                   AND e.model_name = ?
                   AND e.model_revision = ?
                   AND e.text_format_version = ?
+                  AND e.embedding_config_hash = ?
+                  AND e.normalized = ?
                 ORDER BY e.embedding_dimension
                 """,
-                (project_id, model_name, model_revision, text_format_version),
+                (
+                    project_id,
+                    model_name,
+                    model_revision,
+                    text_format_version,
+                    embedding_config_hash,
+                    1 if normalized else 0,
+                ),
             ).fetchall()
         return [int(row["embedding_dimension"]) for row in rows]
 
@@ -429,24 +533,27 @@ class Database:
                 conn.execute(
                     """
                     INSERT INTO code_chunk_embeddings (
-                        code_chunk_id, content_hash, model_name, model_revision,
-                        text_format_version, embedding_dimension, embedding_dtype,
-                        normalized, vector_blob
+                        code_chunk_id, content_hash, embedding_input_hash,
+                        model_name, model_revision, text_format_version,
+                        embedding_config_hash, embedding_dimension,
+                        embedding_dtype, normalized, vector_blob
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (
-                        code_chunk_id, content_hash, model_name,
-                        model_revision, text_format_version
+                        code_chunk_id, embedding_input_hash, model_name,
+                        model_revision, text_format_version,
+                        embedding_config_hash, normalized
                     )
                     DO UPDATE SET
+                        content_hash = excluded.content_hash,
                         embedding_dimension = excluded.embedding_dimension,
                         embedding_dtype = excluded.embedding_dtype,
-                        normalized = excluded.normalized,
                         vector_blob = excluded.vector_blob,
                         updated_at = CURRENT_TIMESTAMP
                     """,
                     values,
                 )
+                self._delete_stale_embeddings_for_record(conn, record)
 
     def get_code_chunk_embeddings_for_project(
         self,
@@ -454,6 +561,8 @@ class Database:
         model_name: str,
         model_revision: str,
         text_format_version: str,
+        embedding_config_hash: str = "",
+        normalized: bool = True,
         path: str | None = None,
         chunk_type: str | None = None,
     ) -> list[dict[str, Any]]:
@@ -463,8 +572,17 @@ class Database:
             "e.model_name = ?",
             "e.model_revision = ?",
             "e.text_format_version = ?",
+            "e.embedding_config_hash = ?",
+            "e.normalized = ?",
         ]
-        params: list[Any] = [project_id, model_name, model_revision, text_format_version]
+        params: list[Any] = [
+            project_id,
+            model_name,
+            model_revision,
+            text_format_version,
+            embedding_config_hash,
+            1 if normalized else 0,
+        ]
         if path:
             conditions.append("c.path = ?")
             params.append(self._normalize_repo_path(path))
@@ -480,6 +598,8 @@ class Database:
                     e.model_name AS embedding_model_name,
                     e.model_revision AS embedding_model_revision,
                     e.text_format_version AS embedding_text_format_version,
+                    e.embedding_input_hash,
+                    e.embedding_config_hash,
                     e.embedding_dimension,
                     e.embedding_dtype,
                     e.normalized,
@@ -501,6 +621,8 @@ class Database:
                     "model_name": row["embedding_model_name"],
                     "model_revision": row["embedding_model_revision"],
                     "text_format_version": row["embedding_text_format_version"],
+                    "embedding_input_hash": row["embedding_input_hash"],
+                    "embedding_config_hash": row["embedding_config_hash"],
                     "embedding_dimension": dimension,
                     "embedding_dtype": row["embedding_dtype"],
                     "normalized": bool(row["normalized"]),
@@ -843,16 +965,48 @@ class Database:
         dtype = record.get("embedding_dtype") or "float32"
         if dtype != "float32":
             raise ValueError(f"unsupported embedding dtype: {dtype}")
+        normalized = bool(record.get("normalized", True))
+        if normalized:
+            _validate_normalized_vector(vector)
         return (
             int(record["code_chunk_id"]),
             record["content_hash"],
+            _require_hash(record["embedding_input_hash"], "embedding_input_hash"),
             record["model_name"],
             record.get("model_revision") or "",
             record["text_format_version"],
+            _require_hash(record["embedding_config_hash"], "embedding_config_hash"),
             dimension,
             dtype,
-            1 if record.get("normalized", True) else 0,
+            1 if normalized else 0,
             pack_float32_vector(vector),
+        )
+
+    def _delete_stale_embeddings_for_record(
+        self,
+        conn: sqlite3.Connection,
+        record: dict[str, Any],
+    ) -> None:
+        conn.execute(
+            """
+            DELETE FROM code_chunk_embeddings
+            WHERE code_chunk_id = ?
+              AND model_name = ?
+              AND model_revision = ?
+              AND text_format_version = ?
+              AND embedding_config_hash = ?
+              AND normalized = ?
+              AND embedding_input_hash != ?
+            """,
+            (
+                int(record["code_chunk_id"]),
+                record["model_name"],
+                record.get("model_revision") or "",
+                record["text_format_version"],
+                _require_hash(record["embedding_config_hash"], "embedding_config_hash"),
+                1 if record.get("normalized", True) else 0,
+                _require_hash(record["embedding_input_hash"], "embedding_input_hash"),
+            ),
         )
 
     def _code_chunk_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
@@ -894,7 +1048,10 @@ def unpack_float32_vector(blob: bytes, dimension: int) -> list[float]:
             f"embedding vector byte length {len(blob)} does not match "
             f"dimension {dimension}"
         )
-    return list(struct.unpack(f"<{dimension}f", blob))
+    values = list(struct.unpack(f"<{dimension}f", blob))
+    if any(not math.isfinite(value) for value in values):
+        raise ValueError("embedding vectors must contain only finite numbers")
+    return values
 
 
 def _as_float32(value: float) -> float:
@@ -902,3 +1059,17 @@ def _as_float32(value: float) -> float:
     if not math.isfinite(number):
         raise ValueError("embedding vectors must contain only finite numbers")
     return struct.unpack("<f", struct.pack("<f", number))[0]
+
+
+def _validate_normalized_vector(vector: Sequence[float]) -> None:
+    values = [_as_float32(value) for value in vector]
+    norm = math.sqrt(sum(value * value for value in values))
+    if not math.isclose(norm, 1.0, rel_tol=1e-3, abs_tol=1e-3):
+        raise ValueError("embedding vector is marked normalized but has non-unit norm")
+
+
+def _require_hash(value: Any, field_name: str) -> str:
+    text = str(value)
+    if len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
+        raise ValueError(f"{field_name} must be a lowercase sha256 hex digest")
+    return text

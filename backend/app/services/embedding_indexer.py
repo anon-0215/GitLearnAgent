@@ -9,7 +9,9 @@ from app.services.embedding_service import (
     CODE_CHUNK_TEXT_FORMAT_VERSION,
     EmbeddingError,
     EmbeddingService,
+    build_code_chunk_embedding_input_hash,
     build_code_chunk_document_text,
+    build_embedding_config_hash,
 )
 
 
@@ -41,8 +43,8 @@ class EmbeddingIndexer:
 
     def index_project(self, project_id: str) -> EmbeddingIndexStats:
         started = perf_counter()
-        identity = self.embedding_service.get_model_identity()
         chunks = self.database.get_code_chunks(project_id)
+        identity = self.embedding_service.get_model_identity()
         warnings: list[str] = []
         if not self.embedding_service.settings.enabled:
             warnings.append("Embeddings are disabled by EMBEDDING_ENABLED=false.")
@@ -58,12 +60,25 @@ class EmbeddingIndexer:
                 duration_ms=_elapsed_ms(started),
                 warnings=warnings,
             )
+        if chunks:
+            identity = self.embedding_service.ensure_model_identity()
+        embedding_config_hash = build_embedding_config_hash(self.embedding_service.settings)
+        embedding_input_hashes = {
+            int(chunk["id"]): build_code_chunk_embedding_input_hash(
+                chunk,
+                self.embedding_service.settings,
+            )
+            for chunk in chunks
+        }
 
         missing = self.database.get_code_chunks_missing_embeddings(
             project_id,
             identity.model_name,
             identity.model_revision,
             CODE_CHUNK_TEXT_FORMAT_VERSION,
+            embedding_config_hash,
+            self.embedding_service.settings.normalize,
+            embedding_input_hashes,
         )
         generated = 0
         failed = 0
@@ -81,9 +96,14 @@ class EmbeddingIndexer:
                         {
                             "code_chunk_id": chunk["id"],
                             "content_hash": chunk["content_hash"],
+                            "embedding_input_hash": build_code_chunk_embedding_input_hash(
+                                chunk,
+                                self.embedding_service.settings,
+                            ),
                             "model_name": identity.model_name,
                             "model_revision": identity.model_revision,
                             "text_format_version": CODE_CHUNK_TEXT_FORMAT_VERSION,
+                            "embedding_config_hash": embedding_config_hash,
                             "embedding_dimension": len(vector),
                             "embedding_dtype": "float32",
                             "normalized": self.embedding_service.settings.normalize,
@@ -106,6 +126,8 @@ class EmbeddingIndexer:
             identity.model_name,
             identity.model_revision,
             CODE_CHUNK_TEXT_FORMAT_VERSION,
+            embedding_config_hash,
+            self.embedding_service.settings.normalize,
         )
         if dimension is None and len(cached_dimensions) == 1:
             dimension = cached_dimensions[0]

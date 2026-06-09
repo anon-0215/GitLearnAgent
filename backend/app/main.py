@@ -46,14 +46,16 @@ class AskRequest(BaseModel):
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
+    embedding_identity = embedding_service.get_model_identity()
     return {
         "ok": True,
         "llm_available": llm.available,
         "github_token_configured": bool(get_env_value("GITHUB_TOKEN")),
         "embedding_enabled": embedding_service.settings.enabled,
         "embedding_available": embedding_service.is_available(),
-        "embedding_model": embedding_service.get_model_identity().model_name,
-        "embedding_device": embedding_service.get_model_identity().device,
+        "embedding_model": embedding_identity.model_name,
+        "embedding_model_revision": embedding_identity.model_revision,
+        "embedding_device": embedding_identity.device,
         "database": str(Path(db.path)),
     }
 

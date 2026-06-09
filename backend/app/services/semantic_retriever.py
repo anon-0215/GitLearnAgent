@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import math
 from typing import Any
 
 from app.database import Database
-from app.services.embedding_service import CODE_CHUNK_TEXT_FORMAT_VERSION, EmbeddingService
+from app.services.embedding_service import (
+    CODE_CHUNK_TEXT_FORMAT_VERSION,
+    EmbeddingService,
+    build_code_chunk_embedding_input_hash,
+    build_embedding_config_hash,
+)
 
 
 DEFAULT_TOP_K = 5
@@ -60,15 +66,27 @@ class SemanticRetriever:
         if not cleaned_query:
             raise ValueError("semantic search query must not be empty")
         limit = _bounded_top_k(top_k)
-        identity = self.embedding_service.get_model_identity()
+        identity = self.embedding_service.ensure_model_identity()
+        embedding_config_hash = build_embedding_config_hash(self.embedding_service.settings)
         candidates = self.database.get_code_chunk_embeddings_for_project(
             project_id,
             identity.model_name,
             identity.model_revision,
             CODE_CHUNK_TEXT_FORMAT_VERSION,
+            embedding_config_hash,
+            self.embedding_service.settings.normalize,
             path=path,
             chunk_type=chunk_type,
         )
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["embedding_input_hash"]
+            == build_code_chunk_embedding_input_hash(
+                candidate,
+                self.embedding_service.settings,
+            )
+        ]
         if not candidates:
             return SemanticSearchOutcome(
                 status="no_embeddings",
@@ -100,6 +118,8 @@ class SemanticRetriever:
             )
             for candidate in candidates
         ]
+        if any(not _is_finite(score) for score, _candidate in scored):
+            raise ValueError("semantic score must be finite")
         scored.sort(
             key=lambda item: (
                 -item[0],
@@ -129,7 +149,11 @@ class SemanticRetriever:
             results=results,
             model_name=identity.model_name,
             total_candidates=len(candidates),
-            warnings=[],
+            warnings=(
+                []
+                if self.embedding_service.settings.normalize
+                else ["Semantic scores are raw dot products because embeddings are not normalized."]
+            ),
         )
 
 
@@ -141,3 +165,7 @@ def _dot(left: list[float], right: list[float]) -> float:
     if len(left) != len(right):
         raise ValueError("embedding vectors must have the same dimension")
     return sum(a * b for a, b in zip(left, right))
+
+
+def _is_finite(value: float) -> bool:
+    return math.isfinite(value)

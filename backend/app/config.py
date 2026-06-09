@@ -7,6 +7,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
+EMBEDDING_MAX_LENGTH_MIN = 16
+EMBEDDING_MAX_LENGTH_MAX = 8192
 
 
 def load_environment() -> None:
@@ -21,6 +23,8 @@ def load_environment() -> None:
 
 
 def get_env_value(key: str, default: str = "") -> str:
+    if key in os.environ:
+        return os.environ[key]
     for env_path in (BACKEND_ROOT / ".env", PROJECT_ROOT / ".env"):
         if not env_path.exists():
             continue
@@ -41,6 +45,7 @@ class EmbeddingSettings:
     cache_dir: Path
     query_prefix: str
     document_prefix: str
+    model_revision: str = ""
 
 
 def get_embedding_settings() -> EmbeddingSettings:
@@ -51,12 +56,17 @@ def get_embedding_settings() -> EmbeddingSettings:
         or "BAAI/bge-m3",
         device=(get_env_value("EMBEDDING_DEVICE", "auto").strip() or "auto").lower(),
         batch_size=max(1, _env_int("EMBEDDING_BATCH_SIZE", 8)),
-        max_length=max(1, _env_int("EMBEDDING_MAX_LENGTH", 8192)),
+        max_length=clamp_embedding_max_length(_env_int("EMBEDDING_MAX_LENGTH", 8192)),
         normalize=_env_bool("EMBEDDING_NORMALIZE", True),
         cache_dir=cache_dir,
         query_prefix=get_env_value("EMBEDDING_QUERY_PREFIX", ""),
         document_prefix=get_env_value("EMBEDDING_DOCUMENT_PREFIX", ""),
+        model_revision=get_env_value("EMBEDDING_MODEL_REVISION", "").strip(),
     )
+
+
+def clamp_embedding_max_length(value: int) -> int:
+    return min(EMBEDDING_MAX_LENGTH_MAX, max(EMBEDDING_MAX_LENGTH_MIN, int(value)))
 
 
 def _load_env_file(path: Path) -> None:

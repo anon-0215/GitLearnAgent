@@ -5,12 +5,17 @@ from pathlib import Path
 
 from app.config import EmbeddingSettings
 from app.database import Database
-from app.services.embedding_service import CODE_CHUNK_TEXT_FORMAT_VERSION, EmbeddingService
+from app.services.embedding_service import (
+    CODE_CHUNK_TEXT_FORMAT_VERSION,
+    EmbeddingService,
+    build_code_chunk_embedding_input_hash,
+    build_embedding_config_hash,
+)
 from app.services.semantic_retriever import SemanticRetriever
 
 
 MODEL_NAME = "fake-model"
-MODEL_REVISION = ""
+MODEL_REVISION = "fake-revision"
 
 
 def _settings():
@@ -24,6 +29,7 @@ def _settings():
         cache_dir=Path("embedding-cache"),
         query_prefix="",
         document_prefix="",
+        model_revision="fake-revision",
     )
 
 
@@ -32,8 +38,9 @@ class QueryBackend:
         self.load_calls = 0
         self.encode_calls = 0
 
-    def load_model(self, model_name_or_path, device, cache_dir, max_length):
+    def load_model(self, model_name_or_path, device, cache_dir, max_length, model_revision):
         self.load_calls += 1
+        self.loaded_model_revision = model_revision
 
     def encode(self, texts, batch_size, normalize):
         self.encode_calls += 1
@@ -49,6 +56,9 @@ class QueryBackend:
 
     def get_embedding_dimension(self):
         return 3
+
+    def get_model_revision(self):
+        return self.loaded_model_revision
 
     def unload_model(self):
         pass
@@ -82,16 +92,22 @@ def _chunk(path, name, content=None, chunk_type="function", start_line=1):
     }
 
 
-def _record(chunk, vector):
+def _record(chunk, vector, settings=None):
+    embedding_settings = settings or _settings()
     return {
         "code_chunk_id": chunk["id"],
         "content_hash": chunk["content_hash"],
+        "embedding_input_hash": build_code_chunk_embedding_input_hash(
+            chunk,
+            embedding_settings,
+        ),
         "model_name": MODEL_NAME,
         "model_revision": MODEL_REVISION,
         "text_format_version": CODE_CHUNK_TEXT_FORMAT_VERSION,
+        "embedding_config_hash": build_embedding_config_hash(embedding_settings),
         "embedding_dimension": len(vector),
         "embedding_dtype": "float32",
-        "normalized": True,
+        "normalized": embedding_settings.normalize,
         "vector": vector,
     }
 
@@ -221,6 +237,21 @@ class SemanticRetrieverTests(unittest.TestCase):
             self.assertEqual(outcome.results, [])
             self.assertEqual(backend.encode_calls, 0)
 
+    def test_stale_embedding_input_hash_is_not_returned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "stale-input.sqlite")
+            project_id = _project_id(db)
+            db.save_code_chunks_for_project(project_id, [_chunk("auth.py", "authenticate_user")])
+            chunk = db.get_code_chunks(project_id)[0]
+            record = _record(chunk, [1.0, 0.0, 0.0])
+            record["embedding_input_hash"] = "0" * 64
+            db.upsert_code_chunk_embeddings([record])
+
+            outcome = SemanticRetriever(db, _service()).search(project_id, "auth")
+
+            self.assertEqual(outcome.status, "no_embeddings")
+            self.assertEqual(outcome.results, [])
+
     def test_dimension_mismatch_is_reported(self):
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "dimension.sqlite")
@@ -254,6 +285,31 @@ class SemanticRetrieverTests(unittest.TestCase):
 
             self.assertEqual(len(retriever.search(project_id, "auth", top_k=0).results), 1)
             self.assertEqual(len(retriever.search(project_id, "auth", top_k=999).results), 3)
+
+    def test_unnormalized_search_reports_raw_dot_product_scores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "raw-dot.sqlite")
+            project_id = _project_id(db)
+            settings = _settings()
+            settings = type(settings)(
+                **{**settings.__dict__, "normalize": False}
+            )
+            db.save_code_chunks_for_project(project_id, [_chunk("auth.py", "authenticate_user")])
+            chunk = db.get_code_chunks(project_id)[0]
+            db.upsert_code_chunk_embeddings([_record(chunk, [2.0, 0.0, 0.0], settings)])
+
+            outcome = SemanticRetriever(db, _service(QueryBackend())).search(project_id, "auth")
+
+            self.assertEqual(outcome.status, "no_embeddings")
+
+            service = EmbeddingService(
+                settings,
+                backend_factory=lambda: QueryBackend(),
+                cuda_available=lambda: False,
+            )
+            raw_outcome = SemanticRetriever(db, service).search(project_id, "auth")
+
+            self.assertIn("raw dot", raw_outcome.warnings[0])
 
     def test_result_contains_complete_source_location(self):
         with tempfile.TemporaryDirectory() as directory:

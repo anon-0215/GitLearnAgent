@@ -20,6 +20,7 @@ def _settings(**overrides):
         "cache_dir": Path("embedding-cache"),
         "query_prefix": "",
         "document_prefix": "",
+        "model_revision": "fake-revision",
     }
     values.update(overrides)
     return EmbeddingSettings(**values)
@@ -31,8 +32,9 @@ class FakeEmbeddingBackend:
         self.load_calls = 0
         self.encode_calls = 0
 
-    def load_model(self, model_name_or_path, device, cache_dir, max_length):
+    def load_model(self, model_name_or_path, device, cache_dir, max_length, model_revision):
         self.load_calls += 1
+        self.loaded_model_revision = model_revision
 
     def encode(self, texts, batch_size, normalize):
         self.encode_calls += 1
@@ -42,6 +44,9 @@ class FakeEmbeddingBackend:
 
     def get_embedding_dimension(self):
         return 2
+
+    def get_model_revision(self):
+        return self.loaded_model_revision
 
     def unload_model(self):
         pass
@@ -156,6 +161,115 @@ class EmbeddingIndexerTests(unittest.TestCase):
             self.assertEqual(stats.cached_chunks, 1)
             self.assertEqual(stats.generated_chunks, 1)
             self.assertEqual(stats.failed_chunks, 0)
+
+    def test_document_prefix_change_reindexes_unchanged_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "prefix.sqlite")
+            project_id = _project_id(db)
+            db.save_code_chunks_for_project(project_id, [_chunk("auth.py", "auth")])
+            EmbeddingIndexer(
+                db,
+                EmbeddingService(
+                    _settings(document_prefix=""),
+                    backend_factory=lambda: FakeEmbeddingBackend(),
+                    cuda_available=lambda: False,
+                ),
+            ).index_project(project_id)
+
+            backend = FakeEmbeddingBackend()
+            stats = EmbeddingIndexer(
+                db,
+                EmbeddingService(
+                    _settings(document_prefix="passage: "),
+                    backend_factory=lambda: backend,
+                    cuda_available=lambda: False,
+                ),
+            ).index_project(project_id)
+
+            self.assertEqual(stats.cached_chunks, 0)
+            self.assertEqual(stats.generated_chunks, 1)
+            self.assertEqual(backend.encode_calls, 1)
+
+    def test_query_prefix_change_reindexes_by_config_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "query-prefix.sqlite")
+            project_id = _project_id(db)
+            db.save_code_chunks_for_project(project_id, [_chunk("auth.py", "auth")])
+            EmbeddingIndexer(
+                db,
+                EmbeddingService(
+                    _settings(query_prefix=""),
+                    backend_factory=lambda: FakeEmbeddingBackend(),
+                    cuda_available=lambda: False,
+                ),
+            ).index_project(project_id)
+
+            backend = FakeEmbeddingBackend()
+            stats = EmbeddingIndexer(
+                db,
+                EmbeddingService(
+                    _settings(query_prefix="query: "),
+                    backend_factory=lambda: backend,
+                    cuda_available=lambda: False,
+                ),
+            ).index_project(project_id)
+
+            self.assertEqual(stats.cached_chunks, 0)
+            self.assertEqual(stats.generated_chunks, 1)
+
+    def test_model_revision_change_reindexes_unchanged_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "revision.sqlite")
+            project_id = _project_id(db)
+            db.save_code_chunks_for_project(project_id, [_chunk("auth.py", "auth")])
+            EmbeddingIndexer(
+                db,
+                EmbeddingService(
+                    _settings(model_revision="rev-a"),
+                    backend_factory=lambda: FakeEmbeddingBackend(),
+                    cuda_available=lambda: False,
+                ),
+            ).index_project(project_id)
+
+            backend = FakeEmbeddingBackend()
+            stats = EmbeddingIndexer(
+                db,
+                EmbeddingService(
+                    _settings(model_revision="rev-b"),
+                    backend_factory=lambda: backend,
+                    cuda_available=lambda: False,
+                ),
+            ).index_project(project_id)
+
+            self.assertEqual(stats.cached_chunks, 0)
+            self.assertEqual(stats.generated_chunks, 1)
+
+    def test_normalize_change_reindexes_unchanged_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "normalize.sqlite")
+            project_id = _project_id(db)
+            db.save_code_chunks_for_project(project_id, [_chunk("auth.py", "auth")])
+            EmbeddingIndexer(
+                db,
+                EmbeddingService(
+                    _settings(normalize=True),
+                    backend_factory=lambda: FakeEmbeddingBackend(),
+                    cuda_available=lambda: False,
+                ),
+            ).index_project(project_id)
+
+            backend = FakeEmbeddingBackend()
+            stats = EmbeddingIndexer(
+                db,
+                EmbeddingService(
+                    _settings(normalize=False),
+                    backend_factory=lambda: backend,
+                    cuda_available=lambda: False,
+                ),
+            ).index_project(project_id)
+
+            self.assertEqual(stats.cached_chunks, 0)
+            self.assertEqual(stats.generated_chunks, 1)
 
     def test_deleted_chunk_clears_cached_embedding(self):
         with tempfile.TemporaryDirectory() as directory:
